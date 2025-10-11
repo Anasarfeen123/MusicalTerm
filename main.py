@@ -1,15 +1,8 @@
-import yt_dlp
-from typing import Dict, Any
+import subprocess
 
-URLS = ['https://www.youtube.com/watch?v=iSFDlT43bxw']
-ydl_opts: Dict[str, Any] = {
-    'format': 'm4a/bestaudio/best',
-    'postprocessors': [{
-        'key': 'FFmpegExtractAudio',
-        'preferredcodec': 'm4a',
-    }]
-}
+video_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+stream_url = subprocess.check_output(
+    ["yt-dlp", "-f", "bestaudio", "-g", video_url]
+).decode().strip()
 
-
-with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-    error_code = ydl.download(URLS)
+subprocess.run(["mpv", "--no-video", stream_url])
