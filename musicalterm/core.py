@@ -24,7 +24,6 @@ def video_info(url, music_source="yt"):
         print(f"Error: Failed to retrieve info.\nReason: {e}")
         return None
 
-
 if __name__ == "__main__":
     url = "https://music.youtube.com/watch?v=BbvRjLPCzJk"
     result = video_info(url)
