@@ -1,8 +1,19 @@
 import subprocess
 import core
+import curses
 
 def play_stream(url):
     cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", url]
+    subprocess.run(cmd)
+
+def pause_stream():
+    # Send SIGSTOP signal to ffplay process
+    cmd = ["pkill", "-STOP", "ffplay"]
+    subprocess.run(cmd)
+
+def resume_stream():
+    # Send SIGCONT signal to ffplay process
+    cmd = ["pkill", "-CONT", "ffplay"]
     subprocess.run(cmd)
 
 if __name__ == "__main__":
