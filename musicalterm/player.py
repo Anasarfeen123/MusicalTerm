@@ -1,19 +1,31 @@
 import subprocess
 import core
-import curses
+
 
 def play_stream(url):
+    """Blocking: spawns ffplay to play the provided stream URL.
+
+    This function is intended to be run in a background thread.
+    """
     cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", url]
     subprocess.run(cmd)
 
+
 def pause_stream():
-    # Send SIGSTOP signal to ffplay process
+    """Pause ffplay by sending SIGSTOP to the process."""
     cmd = ["pkill", "-STOP", "ffplay"]
     subprocess.run(cmd)
 
+
 def resume_stream():
-    # Send SIGCONT signal to ffplay process
+    """Resume ffplay by sending SIGCONT to the process."""
     cmd = ["pkill", "-CONT", "ffplay"]
+    subprocess.run(cmd)
+
+
+def stop_stream():
+    """Stop/kill the ffplay process."""
+    cmd = ["pkill", "-TERM", "ffplay"]
     subprocess.run(cmd)
 
 if __name__ == "__main__":
