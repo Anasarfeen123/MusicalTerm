@@ -1,4 +1,3 @@
-musicalterm/test.py
+test.py
 .vscode/settings.json
-musicalterm/__pycache__
-musicalterm/__pycache__/core.cpython-313.pyc
+__pycache__/*

@@ -70,17 +70,22 @@ def main(stdscr):
         stdscr.getch()
         return
 
-    # Progress variables
-    start_time = time.time()
-    bar_width = width - 20 
-
+    start_time = time.monotonic()
+    bar_width = width - 20
     # Main loop
     try:
+        paused = False
+        elapsed = 0
+        pause_start = 0
+        paused_total = 0
         while True:
-            elapsed = time.time() - start_time
+            if paused:
+                elapsed = pause_start - start_time - paused_total
+            else:
+                elapsed = abs(time.monotonic() - start_time - paused_total)
             progress = min(elapsed / total_seconds, 1.0)
             mins, secs = divmod(int(elapsed), 60)
-            Main_scr.addstr(5, 1, f"Elapsed: {mins:02}:{secs:02} / {duration}")
+            Main_scr.addstr(5, 1, f"Elapsed: {abs(mins):02}:{abs(secs):02} / {duration}")
             draw_progress_bar(Main_scr, 6, 1, bar_width, progress)
             Main_scr.refresh()
 
@@ -88,16 +93,22 @@ def main(stdscr):
             if key == ord('q'):
                 player.stop_stream()
                 break
-            elif key == ord('p'):
+            elif key == ord('p') and not paused:
+                pause_start=time.monotonic()
+                paused = True
                 player.pause_stream()
-            elif key == ord('r'):
+            elif key == ord('r') and paused:
+                paused_total+=time.monotonic()-pause_start
+                paused = False
                 player.resume_stream()
-
             if progress >= 1.0:
                 break
             curses.napms(200)
 
     except KeyboardInterrupt:
+        player.stop_stream()
+    
+    except:
         player.stop_stream()
 
 if __name__ == '__main__':
