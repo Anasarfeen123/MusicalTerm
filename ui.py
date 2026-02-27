@@ -7,9 +7,11 @@ import time
 f = Figlet(font='future')
 def draw_progress_bar(win, y, x, width, progress):
     bar_length = int(progress * width)
-    bar = "█" * bar_length + "-" * (width - bar_length)
+    bar = "#" * bar_length + "-" * (width - bar_length)
     win.addstr(y, x, f"[{bar}] {int(progress*100):3d}%")
     win.refresh()
+
+
 
 def main(stdscr):
     curses.start_color()
@@ -70,41 +72,70 @@ def main(stdscr):
         stdscr.getch()
         return
 
-    start_time = time.monotonic()
-    bar_width = width - 20
-    # Main loop
+    bar_width = max(10, width - 20)
+    stdscr.keypad(True)
+    volume = None
+    
     try:
-        paused = False
-        elapsed = 0
-        pause_start = 0
-        paused_total = 0
         while True:
-            if paused:
-                elapsed = pause_start - start_time - paused_total
-            else:
-                elapsed = abs(time.monotonic() - start_time - paused_total)
-            progress = min(elapsed / total_seconds, 1.0)
+            elapsed = player.get_position()
+            total = player.get_duration()
+
+            if elapsed is None or total is None or total <= 0:
+                curses.napms(100)
+                continue
+
+            if volume is None:
+                volume = player.get_volume() or 50
+                continue
+
+            progress = min(elapsed / total, 1.0)
+
             mins, secs = divmod(int(elapsed), 60)
-            Main_scr.addstr(5, 1, f"Elapsed: {abs(mins):02}:{abs(secs):02} / {duration}")
+            total_m, total_s = divmod(int(total), 60)
+
+            Main_scr.move(4, 1)
+            Main_scr.clrtoeol()
+            if player.is_muted():
+                Main_scr.addstr(4, 1, f"Volume: {volume}% (muted)")
+            else:
+                Main_scr.addstr(4, 1, f"Volume: {volume}%")
+            Main_scr.move(5, 1)
+            Main_scr.clrtoeol()
+            Main_scr.addstr(
+                5, 1,
+                f"Elapsed: {mins:02}:{secs:02} / {total_m:02}:{total_s:02}"
+            )
+
             draw_progress_bar(Main_scr, 6, 1, bar_width, progress)
-            Main_scr.refresh()
 
             key = stdscr.getch()
+
             if key == ord('q'):
                 player.stop_stream()
                 break
-            elif key == ord('p') and not paused:
-                pause_start=time.monotonic()
-                paused = True
+            elif key == ord('p'):
                 player.pause_stream()
-            elif key == ord('r') and paused:
-                paused_total+=time.monotonic()-pause_start
-                paused = False
+            elif key == ord('r'):
                 player.resume_stream()
-            if progress >= 1.0:
-                break
-            curses.napms(200)
+            elif key == curses.KEY_RIGHT:
+                player.seek(5)
+            elif key == curses.KEY_LEFT:
+                player.seek(-5)
+            elif key == curses.KEY_UP:
+                volume=max(0, min(100,volume+5))
+                player.set_volume(volume)
+            elif key == curses.KEY_DOWN:
+                volume=max(0, min(100,volume-5))
+                player.set_volume(volume)
+            elif key == ord('m'):
+                player.toggle_mute()
 
+            if not player.is_running():
+                break
+
+            curses.napms(200)
+        
     except KeyboardInterrupt:
         player.stop_stream()
     
