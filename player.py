@@ -12,6 +12,7 @@ def _connect_ipc():
     global _ipc_socket
 
     _ipc_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    _ipc_socket.settimeout(0.2)
     _ipc_socket.connect(MPV_SOCKET)
 
 def play_stream(url):
@@ -74,7 +75,7 @@ def _send_command(command):
 
         return json.loads(response.decode().strip())
 
-    except (BrokenPipeError, OSError, json.JSONDecodeError):
+    except (BrokenPipeError, OSError, json.JSONDecodeError, socket.timeout):
         return None
 
 def pause_stream():
