@@ -50,15 +50,6 @@ def main(stdscr):
     Main_scr.addstr(3, 1, "[Q] Quit  [P] Pause  [R] Resume")
     Main_scr.refresh()
 
-    # Parse duration (format "mm:ss" or "hh:mm:ss")
-    parts = [int(x) for x in duration.split(':')]
-    if len(parts) == 3:
-        total_seconds = parts[0]*3600 + parts[1]*60 + parts[2]
-    elif len(parts) == 2:
-        total_seconds = parts[0]*60 + parts[1]
-    else:
-        total_seconds = parts[0]
-
     # Start playback thread
     if isinstance(stream_url, str):
         threading.Thread(
@@ -75,7 +66,7 @@ def main(stdscr):
     bar_width = max(10, width - 20)
     stdscr.keypad(True)
     volume = None
-    
+    mute = False
     try:
         while True:
             elapsed = player.get_position()
@@ -96,7 +87,7 @@ def main(stdscr):
 
             Main_scr.move(4, 1)
             Main_scr.clrtoeol()
-            if player.is_muted():
+            if mute:
                 Main_scr.addstr(4, 1, f"Volume: {volume}% (muted)")
             else:
                 Main_scr.addstr(4, 1, f"Volume: {volume}%")
@@ -130,11 +121,12 @@ def main(stdscr):
                 player.set_volume(volume)
             elif key == ord('m'):
                 player.toggle_mute()
+                mute=not mute
 
             if not player.is_running():
                 break
 
-            curses.napms(200)
+            curses.napms(150)
         
     except KeyboardInterrupt:
         player.stop_stream()
