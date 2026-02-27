@@ -67,10 +67,13 @@ def main(stdscr):
     stdscr.keypad(True)
     volume = None
     mute = False
+    total = None
     try:
         while True:
+            if total is None:
+                total = player.get_duration()
+
             elapsed = player.get_position()
-            total = player.get_duration()
 
             if elapsed is None or total is None or total <= 0:
                 curses.napms(100)
@@ -122,7 +125,6 @@ def main(stdscr):
             elif key == ord('m'):
                 player.toggle_mute()
                 mute=not mute
-
             if not player.is_running():
                 break
 

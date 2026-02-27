@@ -6,6 +6,13 @@ import time
 
 MPV_SOCKET = f"/tmp/mpvsocket_{os.getpid()}"
 _mpv_process = None
+_ipc_socket = None
+
+def _connect_ipc():
+    global _ipc_socket
+
+    _ipc_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    _ipc_socket.connect(MPV_SOCKET)
 
 def play_stream(url):
     global _mpv_process
@@ -39,41 +46,59 @@ def play_stream(url):
 
     for _ in range(30):
         if os.path.exists(MPV_SOCKET):
-            return
-        time.sleep(0.1)
+            try:
+                _connect_ipc()
+                return
+            except OSError:
+                time.sleep(0.1)
+        else:
+            time.sleep(0.1)
 
     raise RuntimeError("mpv IPC socket not created")
 
-def _send_command(command, wait_response=True):
-    if not os.path.exists(MPV_SOCKET):
+def _send_command(command):
+    global _ipc_socket
+
+    if _ipc_socket is None:
         return None
 
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.connect(MPV_SOCKET)
-            sock.send(json.dumps(command).encode() + b"\n")
-            if wait_response:
-                response = sock.recv(4096)
-                return json.loads(response)
-    except:
+        _ipc_socket.send(json.dumps(command).encode() + b"\n")
+
+        response = b""
+        while not response.endswith(b"\n"):
+            chunk = _ipc_socket.recv(4096)
+            if not chunk:
+                return None
+            response += chunk
+
+        return json.loads(response.decode().strip())
+
+    except (BrokenPipeError, OSError, json.JSONDecodeError):
         return None
 
-
 def pause_stream():
-    _send_command({"command": ["set_property", "pause", True]}, wait_response=False)
+    _send_command({"command": ["set_property", "pause", True]})
 
 
 def resume_stream():
-    _send_command({"command": ["set_property", "pause", False]}, wait_response=False)
+    _send_command({"command": ["set_property", "pause", False]})
 
 
 def stop_stream():
-    global _mpv_process
+    global _ipc_socket, _mpv_process
 
     try:
-        _send_command({"command": ["quit"]}, wait_response=False)
+        _send_command({"command": ["quit"]})
     except:
         pass
+
+    if _ipc_socket:
+        try:
+            _ipc_socket.close()
+        except:
+            pass
+        _ipc_socket = None
 
     if _mpv_process and _mpv_process.poll() is None:
         _mpv_process.terminate()
@@ -102,10 +127,10 @@ def seek(seconds):
     _send_command({"command": ["seek", seconds, "relative"]})
 
 def set_volume(value):
-    _send_command({"command": ["set_property", "volume", value]}, wait_response=False)
+    _send_command({"command": ["set_property", "volume", value]})
 
 def toggle_mute():
-    _send_command({"command": ["cycle", "mute"]}, wait_response=False)
+    _send_command({"command": ["cycle", "mute"]})
 
 def is_muted():
     res = _send_command({"command": ["get_property", "mute"]})
