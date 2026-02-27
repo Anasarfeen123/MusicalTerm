@@ -3,61 +3,23 @@ import socket
 import json
 import os
 import time
+import core
 
 MPV_SOCKET = f"/tmp/mpvsocket_{os.getpid()}"
 _mpv_process = None
 _ipc_socket = None
 
 
+# -----------------------------
+# IPC CONNECTION
+# -----------------------------
+
 def _connect_ipc():
     global _ipc_socket
     _ipc_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    _ipc_socket.settimeout(1.0)
+    _ipc_socket.settimeout(2.0)
     _ipc_socket.connect(MPV_SOCKET)
 
-def play_stream(url):
-    global _mpv_process, _ipc_socket
-
-    # If mpv running
-    if _mpv_process and _mpv_process.poll() is None:
-        # If socket exists, try replace
-        if _ipc_socket:
-            res = _send_command({"command": ["loadfile", url, "replace"]})
-            if res is not None:
-                return
-        
-        # If socket broken → force clean restart
-        stop_stream()
-
-    # Fresh start
-    if os.path.exists(MPV_SOCKET):
-        os.remove(MPV_SOCKET)
-
-    cmd = [
-        "mpv",
-        "--no-video",
-        "--no-terminal",
-        "--really-quiet",
-        f"--input-ipc-server={MPV_SOCKET}",
-        url,
-    ]
-
-    _mpv_process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-    for _ in range(50):
-        if os.path.exists(MPV_SOCKET):
-            try:
-                _connect_ipc()
-                return
-            except OSError:
-                time.sleep(0.1)
-        time.sleep(0.1)
-
-    raise RuntimeError("mpv IPC socket not created")
 
 def _send_command(command):
     global _ipc_socket
@@ -78,12 +40,74 @@ def _send_command(command):
 
             data = json.loads(response.decode().strip())
 
-            # Ignore async event packets
+            # Return property responses or success
             if "data" in data:
+                return data
+            if data.get("error") == "success":
                 return data
 
     except Exception:
         return None
+
+
+# -----------------------------
+# PLAYBACK CONTROL
+# -----------------------------
+
+def play_stream(url):
+    global _mpv_process, _ipc_socket
+
+    # Resolve direct stream URL using yt-dlp (core layer)
+    resolved = core.resolve_stream(url)
+    if resolved:
+        title, duration, stream_url = resolved
+        if stream_url:
+            url = stream_url
+        else:
+            raise RuntimeError("Failed to resolve stream URL")
+    else:
+        raise RuntimeError("Stream resolution failed")
+
+    # If mpv already running, replace track
+    if _mpv_process and _mpv_process.poll() is None:
+        if _ipc_socket:
+            res = _send_command({"command": ["loadfile", url, "replace"]})
+            if res is not None:
+                return
+        stop_stream()
+
+    # Fresh start
+    if os.path.exists(MPV_SOCKET):
+        os.remove(MPV_SOCKET)
+
+    cmd = [
+        "mpv",
+        "--no-video",
+        "--no-terminal",
+        "--really-quiet",
+        f"--input-ipc-server={MPV_SOCKET}",
+        "--msg-level=all=no",
+        url,
+    ]
+
+    _mpv_process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL
+    )
+
+    # Wait for IPC socket
+    for _ in range(50):
+        if os.path.exists(MPV_SOCKET):
+            try:
+                _connect_ipc()
+                return
+            except OSError:
+                time.sleep(0.1)
+        time.sleep(0.1)
+
+    raise RuntimeError("mpv IPC socket not created")
 
 
 def stop_stream():
@@ -104,7 +128,7 @@ def stop_stream():
     if _mpv_process:
         try:
             _mpv_process.terminate()
-            _mpv_process.wait()   # ← THIS IS IMPORTANT
+            _mpv_process.wait()
         except:
             pass
 
@@ -114,6 +138,10 @@ def stop_stream():
 def is_running():
     return _mpv_process and _mpv_process.poll() is None
 
+
+# -----------------------------
+# CONTROLS
+# -----------------------------
 
 def pause_stream():
     _send_command({"command": ["set_property", "pause", True]})
@@ -134,6 +162,10 @@ def set_volume(value):
 def toggle_mute():
     _send_command({"command": ["cycle", "mute"]})
 
+
+# -----------------------------
+# INFO
+# -----------------------------
 
 def get_position():
     res = _send_command({"command": ["get_property", "time-pos"]})
