@@ -15,13 +15,21 @@ def _connect_ipc():
     _ipc_socket.settimeout(1.0)
     _ipc_socket.connect(MPV_SOCKET)
 
-
 def play_stream(url):
-    global _mpv_process
+    global _mpv_process, _ipc_socket
 
+    # If mpv running
     if _mpv_process and _mpv_process.poll() is None:
+        # If socket exists, try replace
+        if _ipc_socket:
+            res = _send_command({"command": ["loadfile", url, "replace"]})
+            if res is not None:
+                return
+        
+        # If socket broken → force clean restart
         stop_stream()
 
+    # Fresh start
     if os.path.exists(MPV_SOCKET):
         os.remove(MPV_SOCKET)
 
@@ -50,7 +58,6 @@ def play_stream(url):
         time.sleep(0.1)
 
     raise RuntimeError("mpv IPC socket not created")
-
 
 def _send_command(command):
     global _ipc_socket

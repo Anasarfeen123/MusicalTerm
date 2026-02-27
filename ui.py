@@ -1,6 +1,5 @@
 import curses
 from pyfiglet import Figlet
-import threading
 import logging
 import player
 import core
@@ -13,11 +12,6 @@ logging.basicConfig(
     level=logging.DEBUG
 )
 
-def safe_play(url):
-    try:
-        player.play_stream(url)
-    except Exception as e:
-        logging.exception(f"Playback thread crashed: {e}")
 
 def handle_single_track(track):
     return [track]
@@ -91,7 +85,7 @@ def main(stdscr):
     draw_header(header_win, banner_text, width)
     
     # Use the playlist or specific video
-    url = "https://music.youtube.com/playlist?list=PLl578ZPbYIlFcSxuka8Km37VgbUYUWI5p"
+    url = "https://music.youtube.com/playlist?list=PLF09LSCsr9VMLI8WhNk9Mu7dYawruYBDi"
     media = core.extract_media(url)
     if not media:
         stdscr.addstr(height//2, (width-20)//2, "Failed to load stream.")
@@ -109,8 +103,7 @@ def main(stdscr):
 
     title = current_track["title"]
     stream_url = current_track["url"]
-
-    threading.Thread(target=safe_play, args=(stream_url,), daemon=True).start()
+    player.play_stream(stream_url)
     # --- Main Loop State ---
     volume = 50
     total_sec = None
@@ -133,11 +126,7 @@ def main(stdscr):
                 title = current_track["title"]
                 stream_url = current_track["url"]
 
-                threading.Thread(
-                    target=safe_play,
-                    args=(stream_url,),
-                    daemon=True
-                ).start()
+                player.play_stream(stream_url)
 
         elif key == ord("b"):  # Previous track
             if current_index > 0:
@@ -181,7 +170,7 @@ def main(stdscr):
                 current_track = queue[current_index]
                 title = current_track["title"]
                 stream_url = current_track["url"]
-                threading.Thread(target=safe_play, args=(stream_url,), daemon=True).start()
+                player.play_stream(stream_url)
                 continue
             else:
                 # End of playlist
