@@ -147,9 +147,9 @@ def get_album_art_matrix(path, size=30):
             return None, 0, 0
 
         im = Image.open(path).convert("RGB")
-
+        aspect_ratio = im.height / im.width
         new_width = size
-        new_height = int(size * 0.5)
+        new_height = int(aspect_ratio * new_width * 1.1)
 
         im = im.resize(
             (new_width, max(1, new_height)),

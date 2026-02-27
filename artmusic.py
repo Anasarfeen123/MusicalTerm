@@ -64,53 +64,12 @@ def get_image_ascii(path="diwali.jpg", char="█"):
     # 4. Join and Return
     return "\n".join(output_lines)
 
-def get_image_ascii_square(path="diwali.jpg", size=50, char="█"):
-    """
-    Resizes image to a visual square and returns ASCII string.
-    'size' determines the width in characters.
-    """
-    if not os.path.exists(path):
-        return f"Error: {path} not found."
-
-    # 1. Load and Resize to Square
-    im = Image.open(path).convert("RGB")
-    
-    # To look like a square in a terminal, height must be ~55% of width
-    new_width = size
-    new_height = int(size * 0.55) 
-    
-    # We ignore the original aspect ratio to force it into a square shape
-    im = im.resize((new_width, max(1, new_height)), Image.Resampling.LANCZOS)
-    
-    # 2. Setup
-    pixels = list(im.getdata())
-    use_true = supports_truecolor()
-    output_lines = []
-
-    # 3. Build the rows
-    for y in range(im.height):
-        row_str = ""
-        for x in range(im.width):
-            r, g, b = pixels[y * im.width + x]
-            
-            if use_true:
-                row_str += rgb_fg(r, g, b, char)
-            else:
-                row_str += color_for_pixel_ansi(r, g, b) + char
-        
-        if not use_true:
-            row_str += Style.RESET_ALL
-            
-        output_lines.append(row_str)
-
-    return "\n".join(output_lines)
-
 if __name__ == "__main__":
     # Get user input outside the logic function
     char_choice = input("Enter character (default '█'): ") or "█"
     
     # Call function and store the result
-    ascii_result = get_image_ascii_square("image.png", char=char_choice)
+    ascii_result = get_image_ascii("cover.jpg", char_choice)
     
     # Now you can do whatever you want with the string!
     # For example, print it:
