@@ -1,41 +1,63 @@
 import yt_dlp
-import subprocess
 
-def video_info(url, music_source="yt"):
-    if music_source.lower() != "yt":
-        raise ValueError("Unsupported music source")
-
+def extract_media(url):
     ydl_opts = {
-        'format': 'bestaudio/best',
-        'quiet': True,
-        'no_warnings': True,
-        'extract_flat': False,
+        "format": "bestaudio/best",
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": True,
     }
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl: # type: ignore
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-            stream_url = info.get('url')
-            fulltitle = info.get('fulltitle')
-            duration_string = info.get('duration_string')
-            x = (fulltitle, duration_string, stream_url)
-            return x
-    except Exception as e:
-        print(f"Error: Failed to retrieve info.\nReason: {e}")
+
+            # Playlist detected
+            if "entries" in info and info["entries"]:
+                tracks = []
+                for entry in info["entries"]:
+                    if not entry:
+                        continue
+                    tracks.append({
+                        "title": entry.get("title"),
+                        "url": entry.get("url"),
+                    })
+
+                return {
+                    "type": "playlist",
+                    "tracks": tracks,
+                    "title": info.get("title")
+                }
+
+            # Single video
+            return {
+                "type": "video",
+                "tracks": [{
+                    "title": info.get("title"),
+                    "url": info.get("url"),
+                }]
+            }
+
+    except Exception:
         return None
 
-if __name__ == "__main__":
-    url = "https://music.youtube.com/watch?v=BbvRjLPCzJk"
-    result = video_info(url)
-    
-    if result and all(x is not None for x in result):
-        title, duration, stream_url = result
-        print(f"Now playing: {title}  ({duration})")
-        if isinstance(stream_url, str):
-            subprocess.run(["mpv", "--no-video", stream_url])
-        else:
-            print("Invalid stream URL.")
-            exit(1)
-    else:
-        print("Failed to music info.")
-        exit(1)
+def video_info(url):
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": False,
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+            stream_url = info.get("url")
+            title = info.get("fulltitle")
+            duration = info.get("duration_string")
+
+            return title, duration, stream_url
+
+    except Exception:
+        return None
