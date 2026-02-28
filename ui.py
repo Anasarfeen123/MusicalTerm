@@ -1,3 +1,8 @@
+"""
+MusicalTerm — Terminal Music Player
+Aesthetic: Luxury vinyl / dark obsidian / warm gold accents
+"""
+
 import curses
 import threading
 import random
@@ -6,226 +11,281 @@ from pyfiglet import Figlet
 import core
 import player
 
-f = Figlet(font="slant")
+# ─── Fonts ────────────────────────────────────────────────────────────────────
+try:
+    f_title = Figlet(font="banner3-D")
+except Exception:
+    f_title = Figlet(font="banner")
+
+# ─── Design Tokens ────────────────────────────────────────────────────────────
+CHARS = {
+    "bar_fill":    "█",
+    "bar_empty":   "░",
+    "vol_fill":    "▰",
+    "vol_empty":   "▱",
+    "h_line":      "─",
+    "v_line":      "│",
+    "tl":          "╭",
+    "tr":          "╮",
+    "bl":          "╰",
+    "br":          "╯",
+    "t_left":      "├",
+    "t_right":     "┤",
+    "play":        "▶",
+    "pause":       "⏸",
+    "shuffle_on":  "⇄",
+    "shuffle_off": "⇒",
+    "repeat_on":   "↺",
+    "repeat_off":  "↷",
+    "mute":        "✕",
+    "vol":         "♪",
+    "dot":         "·",
+    "arrow":       "›",
+    "bullet":      "◆",
+    "dim_bullet":  "◇",
+    "spin":        ["◐", "◓", "◑", "◒"],
+}
+
+# Color pair IDs
+C_GOLD   = 1
+C_DIM    = 2
+C_WHITE  = 3
+C_GREEN  = 4
+C_TITLE  = 5
+C_STATUS = 6
+C_QUEUE_H = 7
 
 # ─── Art State ────────────────────────────────────────────────────────────────
 art_lock = threading.Lock()
-art_data = {"pixels": None, "w": 0, "h": 0, "loading": False, "url": None}
+art_data = {"pixels": None, "w": 0, "h": 0, "loading": False}
 
-# ─── Playback State ───────────────────────────────────────────────────────────
+
+# ─── State ────────────────────────────────────────────────────────────────────
 class State:
     def __init__(self):
-        self.queue         = []
-        self.history       = []          # for back-tracking
-        self.current_idx   = 0
-        self.volume        = 70
-        self.paused        = False
-        self.repeat        = False       # repeat current track
-        self.shuffle       = False
-        self.view          = "player"    # "player" | "queue"
-        self.queue_offset  = 0          # scroll offset for queue view
-        self.status_msg    = ""
-        self.status_ts     = 0
-        self.spin_idx      = 0
+        self.queue        = []
+        self.history      = []
+        self.current_idx  = 0
+        self.volume       = 70
+        self.paused       = False
+        self.repeat       = False
+        self.shuffle      = False
+        self.muted        = False
+        self.view         = "player"
+        self.queue_offset = 0
+        self._status_msg  = ""
+        self._status_ts   = 0
+        self.spin_idx     = 0
 
-    def set_status(self, msg):
-        self.status_msg = msg
-        self.status_ts  = time.time()
+    def set_status(self, msg, ttl=3.0):
+        self._status_msg = msg
+        self._status_ts  = time.time() + ttl
 
     def get_status(self):
-        if time.time() - self.status_ts < 3:
-            return self.status_msg
-        return ""
+        return self._status_msg if time.time() < self._status_ts else ""
 
     def next_idx(self):
         if self.shuffle:
-            return random.randrange(len(self.queue))
+            choices = [i for i in range(len(self.queue)) if i != self.current_idx]
+            return random.choice(choices) if choices else self.current_idx
         return (self.current_idx + 1) % len(self.queue)
-
-    def prev_idx(self):
-        if self.history:
-            return self.history[-1]
-        return max(0, self.current_idx - 1)
 
 
 # ─── Art Loading ──────────────────────────────────────────────────────────────
 
-def bg_update_art(url, art_width):
+def _bg_load_art(url, art_width):
     with art_lock:
         art_data["loading"] = True
         art_data["pixels"]  = None
-        art_data["url"]     = url
-
     if core.download_thumbnail(url, "cover.jpg"):
         px, w, h = core.get_album_art_matrix("cover.jpg", size=art_width - 4)
         with art_lock:
-            art_data["pixels"] = px
-            art_data["w"]      = w
-            art_data["h"]      = h
-
+            art_data.update(pixels=px, w=w, h=h)
     with art_lock:
         art_data["loading"] = False
 
 
 def trigger_art_load(url, art_width):
-    t = threading.Thread(target=bg_update_art, args=(url, art_width), daemon=True)
-    t.start()
+    threading.Thread(target=_bg_load_art, args=(url, art_width), daemon=True).start()
 
 
 def draw_art(win, pixels, img_w, img_h):
     if not pixels:
         return
-
-    def rgb_to_256(r, g, b):
-        return 16 + int(r / 255 * 5) * 36 + int(g / 255 * 5) * 6 + int(b / 255 * 5)
-
-    pair_cache  = {}
-    next_pair_id = 10
-
+    def to256(r, g, b):
+        return 16 + int(r/255*5)*36 + int(g/255*5)*6 + int(b/255*5)
+    cache, nxt = {}, 10
     for y in range(0, img_h - 1, 2):
         for x in range(img_w):
             ti = y * img_w + x
-            bi = (y + 1) * img_w + x
+            bi = (y+1) * img_w + x
             if ti >= len(pixels) or bi >= len(pixels):
                 continue
-
-            r1, g1, b1 = pixels[ti]
-            r2, g2, b2 = pixels[bi]
-            fg = rgb_to_256(r1, g1, b1)
-            bg = rgb_to_256(r2, g2, b2)
+            r1,g1,b1 = pixels[ti]
+            r2,g2,b2 = pixels[bi]
+            fg, bg = to256(r1,g1,b1), to256(r2,g2,b2)
             key = (fg, bg)
-
-            if key not in pair_cache:
-                if next_pair_id < curses.COLOR_PAIRS:
-                    curses.init_pair(next_pair_id, fg, bg)
-                    pair_cache[key] = next_pair_id
-                    next_pair_id += 1
+            if key not in cache:
+                if nxt < curses.COLOR_PAIRS:
+                    curses.init_pair(nxt, fg, bg)
+                    cache[key] = nxt; nxt += 1
                 else:
-                    pair_cache[key] = 0
-
+                    cache[key] = 0
             try:
-                win.addch((y // 2) + 1, x + 1, "▀", curses.color_pair(pair_cache[key]))
+                win.addch((y//2)+1, x+1, "▀", curses.color_pair(cache[key]))
             except curses.error:
                 pass
 
 
-# ─── UI Components ────────────────────────────────────────────────────────────
+# ─── Primitives ───────────────────────────────────────────────────────────────
 
-def draw_border_titled(win, title, color_pair=1):
+def S(win, y, x, text, attr=0):
+    try: win.addstr(y, x, text, attr)
+    except curses.error: pass
+
+
+def draw_box(win, h, w, cp):
+    c = CHARS
+    S(win, 0,   0,   c["tl"] + c["h_line"]*(w-2) + c["tr"], cp)
+    S(win, h-1, 0,   c["bl"] + c["h_line"]*(w-2) + c["br"], cp)
+    for r in range(1, h-1):
+        S(win, r, 0,   c["v_line"], cp)
+        S(win, r, w-1, c["v_line"], cp)
+
+
+def draw_hrule(win, y, x, w, cp):
+    S(win, y, x,       CHARS["t_left"],         cp)
+    S(win, y, x+1,     CHARS["h_line"]*(w-2),   cp)
+    S(win, y, x+w-1,   CHARS["t_right"],         cp)
+
+
+def panel_label(win, text, w, cp):
+    label = f"  {text}  "
+    S(win, 0, max(2, (w - len(label))//2), label, cp | curses.A_BOLD)
+
+
+def trunc(s, n):
+    return (s[:n-1] + "…") if len(s) > n else s
+
+
+def fmt_t(s):
+    if s is None: return "--:--"
+    m, sec = divmod(int(s), 60)
+    return f"{m:02}:{sec:02}"
+
+
+# ─── Panels ───────────────────────────────────────────────────────────────────
+
+def render_art_panel(win, st, art_w, art_h):
     win.erase()
-    win.attron(curses.color_pair(color_pair))
-    win.border()
-    win.attroff(curses.color_pair(color_pair))
-    if title:
-        label = f" {title} "
-        try:
-            win.addstr(0, 2, label, curses.color_pair(color_pair) | curses.A_BOLD)
-        except curses.error:
-            pass
+    gold = curses.color_pair(C_GOLD)
+    dim  = curses.color_pair(C_DIM)
+    draw_box(win, art_h, art_w, gold)
+    panel_label(win, "A L B U M", art_w, gold)
+
+    with art_lock:
+        loading = art_data["loading"]
+        pixels  = art_data["pixels"]
+        iw, ih  = art_data["w"], art_data["h"]
+
+    if loading:
+        sp = CHARS["spin"][st.spin_idx % 4]
+        S(win, art_h//2, (art_w-12)//2, f" {sp}  loading… ", dim)
+    elif pixels:
+        draw_art(win, pixels, iw, ih)
+    else:
+        S(win, art_h//2, (art_w-14)//2, "  no thumbnail  ", dim | curses.A_DIM)
+    win.refresh()
 
 
-def draw_progress_bar(win, y, x, width, progress):
-    if width < 10:
-        return
-    bar_w   = width - 10
-    filled  = int(progress * bar_w)
-    bar     = "█" * filled + "░" * (bar_w - filled)
-    pct     = f"{int(progress * 100):3d}%"
-    try:
-        win.addstr(y, x,              "▕", curses.color_pair(3))
-        win.addstr(y, x + 1,          bar, curses.color_pair(3))
-        win.addstr(y, x + bar_w + 1,  "▏", curses.color_pair(3))
-        win.addstr(y, x + bar_w + 3,  pct, curses.A_BOLD)
-    except curses.error:
-        pass
+def render_player_panel(win, st, p_w, p_h):
+    win.erase()
+    gold  = curses.color_pair(C_GOLD)
+    dim   = curses.color_pair(C_DIM)
+    white = curses.color_pair(C_WHITE)
+    grn   = curses.color_pair(C_GREEN)
+    stat  = curses.color_pair(C_STATUS)
+    iw    = p_w - 4
 
+    draw_box(win, p_h, p_w, gold)
+    panel_label(win, "N O W  P L A Y I N G", p_w, gold)
 
-def fmt_time(secs):
-    if secs is None:
-        return "--:--"
-    m, s = divmod(int(secs), 60)
-    return f"{m:02}:{s:02}"
+    # Title + counter
+    track   = st.queue[st.current_idx] if st.queue else None
+    title   = track["title"] if track else "No track loaded"
+    counter = f"{st.current_idx+1:02}/{len(st.queue):02}"
+    S(win, 2, 2, trunc(title, iw - len(counter) - 2), white | curses.A_BOLD)
+    S(win, 2, p_w - len(counter) - 2, counter, dim)
 
+    draw_hrule(win, 3, 0, p_w, gold)
 
-def draw_player_panel(win, st: State, p_w, p_h, spinner):
-    draw_border_titled(win, "NOW PLAYING")
+    # Mode flags
+    flags = [
+        (CHARS["pause"] if st.paused else CHARS["play"],
+         "PAUSED" if st.paused else "PLAYING",
+         stat if st.paused else white),
+        (CHARS["shuffle_on"] if st.shuffle else CHARS["shuffle_off"],
+         "SHUFFLE",
+         gold if st.shuffle else dim),
+        (CHARS["repeat_on"] if st.repeat else CHARS["repeat_off"],
+         "REPEAT",
+         gold if st.repeat else dim),
+    ]
+    if st.muted:
+        flags.append((CHARS["mute"], "MUTED", stat))
 
-    track = st.queue[st.current_idx] if st.queue else None
-    title = track["title"] if track else "No track"
+    cx = 2
+    for icon, lbl, attr in flags:
+        seg = f"{icon} {lbl}  "
+        S(win, 4, cx, seg, attr)
+        cx += len(seg)
 
-    max_title = p_w - 6
-    display   = (title[:max_title - 2] + "..") if len(title) > max_title else title
+    draw_hrule(win, 5, 0, p_w, gold)
 
-    # Title
-    try:
-        win.addstr(2, 3, display, curses.color_pair(1) | curses.A_BOLD)
-    except curses.error:
-        pass
+    # Volume
+    vbw    = iw - 10
+    vfill  = round((st.volume / 100) * vbw)
+    vbar   = CHARS["vol_fill"]*vfill + CHARS["vol_empty"]*(vbw-vfill)
+    vlabel = f"{CHARS['vol']} {st.volume:3d}%"
+    S(win, 6, 2, vlabel, gold | curses.A_BOLD)
+    S(win, 6, 2 + len(vlabel) + 1, vbar, grn)
 
-    # Track counter
-    counter = f"{st.current_idx + 1}/{len(st.queue)}"
-    try:
-        win.addstr(2, p_w - len(counter) - 2, counter, curses.color_pair(5))
-    except curses.error:
-        pass
+    draw_hrule(win, p_h - 5, 0, p_w, gold)
 
-    # Status flags
-    flags = []
-    if st.shuffle: flags.append("⇀ SHUFFLE")
-    if st.repeat:  flags.append("↺ REPEAT")
-    if st.paused:  flags.append("⏸ PAUSED")
-    flag_str = "  ".join(flags)
-    try:
-        win.addstr(3, 3, flag_str, curses.color_pair(2))
-    except curses.error:
-        pass
-
-    # Volume bar
-    vol_bar_w = min(20, p_w - 16)
-    vol_filled = int((st.volume / 100) * vol_bar_w)
-    vol_bar = "▮" * vol_filled + "▯" * (vol_bar_w - vol_filled)
-    try:
-        win.addstr(5, 3, f"VOL  {vol_bar}  {st.volume:3d}%", curses.color_pair(2))
-    except curses.error:
-        pass
-
-    # Time & progress
+    # Progress
     elapsed  = player.get_position()
     duration = player.get_duration()
-
     if elapsed is not None and duration and duration > 0:
-        time_str = f"{fmt_time(elapsed)} / {fmt_time(duration)}"
-        try:
-            win.addstr(p_h - 4, 3, time_str, curses.color_pair(5))
-        except curses.error:
-            pass
-        draw_progress_bar(win, p_h - 3, 3, p_w - 6, min(1.0, elapsed / duration))
+        prog   = min(1.0, elapsed / duration)
+        bw     = iw - 2
+        filled = round(prog * bw)
+        bar    = CHARS["bar_fill"]*filled + CHARS["bar_empty"]*(bw-filled)
+        tstr   = f"{fmt_t(elapsed)}  {CHARS['arrow']}  {fmt_t(duration)}"
+        S(win, p_h-4, 2, tstr, dim)
+        S(win, p_h-3, 2, bar,  grn | curses.A_BOLD)
+        S(win, p_h-3, p_w - 5, f"{int(prog*100):3d}%", gold)
     else:
-        try:
-            win.addstr(p_h - 3, 3,
-                       f"{spinner[st.spin_idx % len(spinner)]}  Buffering...",
-                       curses.A_DIM)
-        except curses.error:
-            pass
+        sp = CHARS["spin"][st.spin_idx % 4]
+        S(win, p_h-4, 2, f"{sp}  buffering…", dim | curses.A_DIM)
 
-    # Inline status message
+    # Status
     status = st.get_status()
     if status:
-        try:
-            win.addstr(p_h - 2, 3, status, curses.color_pair(2) | curses.A_DIM)
-        except curses.error:
-            pass
+        S(win, p_h-2, 2, trunc(status, iw), stat | curses.A_DIM)
 
     win.refresh()
 
 
-def draw_queue_panel(win, st: State, p_w, p_h):
-    draw_border_titled(win, "QUEUE")
+def render_queue_panel(win, st, p_w, p_h):
+    win.erase()
+    gold  = curses.color_pair(C_GOLD)
+    dim   = curses.color_pair(C_DIM)
+    hl    = curses.color_pair(C_QUEUE_H)
 
-    visible = p_h - 3
-    total   = len(st.queue)
+    draw_box(win, p_h, p_w, gold)
+    panel_label(win, f"Q U E U E  ({len(st.queue)})", p_w, gold)
 
-    # Clamp scroll so current track is always visible
+    visible = p_h - 4
     if st.current_idx < st.queue_offset:
         st.queue_offset = st.current_idx
     elif st.current_idx >= st.queue_offset + visible:
@@ -233,58 +293,62 @@ def draw_queue_panel(win, st: State, p_w, p_h):
 
     for i in range(visible):
         idx = st.queue_offset + i
-        if idx >= total:
-            break
-        track   = st.queue[idx]
-        label   = track["title"] or "Unknown"
-        label   = (label[:p_w - 8] + "..") if len(label) > p_w - 8 else label
-        row     = i + 1
-        is_cur  = idx == st.current_idx
+        if idx >= len(st.queue): break
+        label  = trunc(st.queue[idx].get("title") or "Unknown", p_w - 8)
+        is_cur = idx == st.current_idx
+        if is_cur:
+            S(win, i+2, 1, f" {CHARS['bullet']} {label}", hl | curses.A_BOLD)
+        else:
+            S(win, i+2, 1, f"{idx+1:3}. {label}", dim)
 
-        prefix = "▶ " if is_cur else f"{idx+1:2}. "
-        try:
-            attr = (curses.color_pair(1) | curses.A_BOLD) if is_cur else curses.color_pair(5)
-            win.addstr(row, 2, prefix + label, attr)
-        except curses.error:
-            pass
-
-    # Scroll indicator
+    total = len(st.queue)
     if total > visible:
-        scroll_pct = f"  {st.queue_offset + 1}-{min(st.queue_offset + visible, total)}/{total}"
-        try:
-            win.addstr(p_h - 1, p_w - len(scroll_pct) - 1, scroll_pct, curses.color_pair(5) | curses.A_DIM)
-        except curses.error:
-            pass
+        end  = min(st.queue_offset + visible, total)
+        note = f" {st.queue_offset+1}–{end}/{total} "
+        S(win, p_h-2, p_w-len(note)-1, note, dim | curses.A_DIM)
 
     win.refresh()
 
 
-def draw_footer(win, width, view):
+def render_footer(win, width, st):
     win.erase()
-    if view == "player":
-        help_str = " [Q]uit [P]ause [R]esume [N]ext [B]ack [S]huffle [L]oop [↑↓]Vol [←→]Seek [TAB]Queue "
-    else:
-        help_str = " [TAB]Back to Player  [↑↓]Scroll Queue "
-    x = max(0, (width - len(help_str)) // 2)
+    gold = curses.color_pair(C_GOLD)
+    dim  = curses.color_pair(C_DIM)
+
     try:
-        win.addstr(0, x, help_str, curses.color_pair(4) | curses.A_DIM)
+        win.addstr(0, 0, CHARS["h_line"] * (width - 1), gold)
     except curses.error:
         pass
+
+    if st.view == "player":
+        keys = [("Q","quit"),("P","pause"),("R","resume"),("N","next"),
+                ("B","back"),("S","shuffle"),("L","loop"),("M","mute"),
+                ("↑↓","vol"),("←→","seek"),("TAB","queue")]
+    else:
+        keys = [("TAB","player"),("↑↓","scroll"),("↵","play"),("Q","quit")]
+
+    cx = max(0, (width - sum(len(k)+len(v)+4 for k,v in keys) - len(keys)) // 2)
+    for i, (k, v) in enumerate(keys):
+        S(win, 1, cx, f" {k} ", gold | curses.A_BOLD)
+        cx += len(k) + 2
+        S(win, 1, cx, f"{CHARS['dot']} {v} ", dim)
+        cx += len(v) + 4
+        if i < len(keys) - 1:
+            S(win, 1, cx, CHARS["v_line"], gold)
+            cx += 1
+
     win.refresh()
 
 
-def draw_header(win, banner, width):
+def render_header(win, banner, width):
     win.erase()
+    gold = curses.color_pair(C_TITLE)
     for i, line in enumerate(banner):
-        x = max(0, (width - len(line)) // 2)
-        try:
-            win.addstr(i, x, line, curses.color_pair(1) | curses.A_BOLD)
-        except curses.error:
-            pass
+        S(win, i, max(0, (width - len(line))//2), line, gold | curses.A_BOLD)
     win.refresh()
 
 
-# ─── Main UI Loop ─────────────────────────────────────────────────────────────
+# ─── Main ─────────────────────────────────────────────────────────────────────
 
 def run_ui(stdscr):
     curses.curs_set(0)
@@ -293,55 +357,58 @@ def run_ui(stdscr):
     stdscr.nodelay(True)
     stdscr.keypad(True)
 
-    curses.init_pair(1, curses.COLOR_CYAN,    -1)   # Accent / titles
-    curses.init_pair(2, curses.COLOR_YELLOW,  -1)   # Status / flags
-    curses.init_pair(3, curses.COLOR_GREEN,   -1)   # Progress bar
-    curses.init_pair(4, curses.COLOR_WHITE,   -1)   # Footer
-    curses.init_pair(5, 245,                  -1)   # Muted text (gray)
+    curses.init_pair(C_GOLD,    214, -1)
+    curses.init_pair(C_DIM,     242, -1)
+    curses.init_pair(C_WHITE,   255, -1)
+    curses.init_pair(C_GREEN,   149, -1)
+    curses.init_pair(C_TITLE,   220, -1)
+    curses.init_pair(C_STATUS,  208, -1)
+    curses.init_pair(C_QUEUE_H, 214, -1)
 
     height, width = stdscr.getmaxyx()
-    if height < 24 or width < 80:
-        stdscr.addstr(0, 0, f"Terminal too small ({width}x{height}). Need 80x24 min.")
+    if height < 24 or width < 82:
+        S(stdscr, 0, 0,
+          f"  Terminal too small ({width}×{height}). Need 82×24 minimum.  ",
+          curses.color_pair(C_STATUS) | curses.A_BOLD)
         stdscr.refresh()
-        curses.napms(2500)
+        curses.napms(3000)
         return
 
-    banner   = f.renderText("MusicalTerm").splitlines()
-    banner_h = len(banner)
+    banner   = f_title.renderText("MT").splitlines()
+    banner_h = len(banner) + 1
+    art_w, art_h = 40, 20
+    p_w  = min(width - art_w - 6, 58)
+    p_h  = art_h
+    sx   = max(0, (width - art_w - p_w - 2) // 2)
+    cy   = banner_h + 1
 
-    art_w = 42
-    art_h = 20
-    p_w   = min(width - art_w - 8, 55)
-    p_h   = art_h
+    header_win = curses.newwin(banner_h, width, 0,      0)
+    art_win    = curses.newwin(art_h,    art_w, cy,     sx)
+    main_win   = curses.newwin(p_h,      p_w,   cy,     sx + art_w + 2)
+    footer_win = curses.newwin(3,        width, height-3, 0)
 
-    total_ui_w = art_w + p_w + 4
-    start_x    = (width - total_ui_w) // 2
+    render_header(header_win, banner, width)
 
-    header_win = curses.newwin(banner_h + 1, width,  1,              0)
-    art_win    = curses.newwin(art_h,        art_w,  banner_h + 2,   start_x)
-    main_win   = curses.newwin(p_h,          p_w,    banner_h + 2,   start_x + art_w + 2)
-    footer_win = curses.newwin(2,            width,  height - 2,     0)
+    # Loading indicator
+    S(stdscr, cy + art_h//2, sx + 2, "  ◐  fetching playlist…  ",
+      curses.color_pair(C_DIM) | curses.A_DIM)
+    stdscr.refresh()
 
-    draw_header(header_win, banner, width)
-
-    # ── Load media ──
-    url   = "https://music.youtube.com/playlist?list=PLF09LSCsr9VMLI8WhNk9Mu7dYawruYBDi"
-    media = core.extract_media(url)
-
+    media = core.extract_media(
+        "https://music.youtube.com/playlist?list=PLF09LSCsr9VMLI8WhNk9Mu7dYawruYBDi"
+    )
     if not media or not media.get("tracks"):
-        stdscr.addstr(height // 2, width // 2 - 12,
-                      "  FAILED TO LOAD MEDIA  ", curses.color_pair(2) | curses.A_BOLD)
+        S(stdscr, cy + art_h//2, sx + 2, "  ✕  failed to load media.  ",
+          curses.color_pair(C_STATUS) | curses.A_BOLD)
         stdscr.refresh()
-        curses.napms(2500)
+        curses.napms(3000)
         return
 
-    st          = State()
-    st.queue    = media["tracks"]
-    st.volume   = 70
-    spinner     = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
+    st       = State()
+    st.queue = media["tracks"]
 
-    def start_track(idx, push_history=True):
-        if push_history and st.current_idx != idx:
+    def start_track(idx, push=True):
+        if push and st.current_idx != idx:
             st.history.append(st.current_idx)
         st.current_idx = idx
         track = st.queue[idx]
@@ -349,111 +416,60 @@ def run_ui(stdscr):
         player.set_volume(st.volume)
         st.paused = False
         trigger_art_load(track["url"], art_w)
-        st.set_status(f"▶  {track['title'][:40]}")
+        st.set_status(f"{CHARS['play']}  {trunc(track['title'] or '…', 40)}")
 
-    start_track(st.current_idx, push_history=False)
-
-    last_track_end = False
+    start_track(0, push=False)
+    _end_armed = False
 
     while True:
         key = stdscr.getch()
 
-        # ── Handle key input ──
         if key == ord("q"):
-            player.stop_stream()
-            break
+            player.stop_stream(); break
 
-        elif key == ord("\t"):                     # TAB: toggle view
+        elif key == ord("\t"):
             st.view = "queue" if st.view == "player" else "player"
 
         elif st.view == "queue":
-            if key == curses.KEY_UP:
-                st.queue_offset = max(0, st.queue_offset - 1)
-            elif key == curses.KEY_DOWN:
-                st.queue_offset = min(len(st.queue) - 1, st.queue_offset + 1)
+            if   key == curses.KEY_UP:   st.queue_offset = max(0, st.queue_offset-1)
+            elif key == curses.KEY_DOWN: st.queue_offset = min(len(st.queue)-1, st.queue_offset+1)
             elif key in [ord("\n"), curses.KEY_ENTER]:
-                start_track(st.queue_offset)
+                start_track(st.queue_offset); st.view = "player"
 
-        else:  # player view keys
-            if key == ord("n"):
-                nxt = st.next_idx()
-                start_track(nxt)
+        else:
+            if   key == ord("n"):           start_track(st.next_idx())
             elif key == ord("b"):
-                if st.history:
-                    prev = st.history.pop()
-                    start_track(prev, push_history=False)
-                elif st.current_idx > 0:
-                    start_track(st.current_idx - 1)
-            elif key == ord("p"):
-                player.pause_stream()
-                st.paused = True
-                st.set_status("⏸  Paused")
-            elif key == ord("r"):
-                player.resume_stream()
-                st.paused = False
-                st.set_status("▶  Resumed")
-            elif key == ord("s"):
-                st.shuffle = not st.shuffle
-                st.set_status(f"⇀ Shuffle {'ON' if st.shuffle else 'OFF'}")
-            elif key == ord("l"):
-                st.repeat = not st.repeat
-                st.set_status(f"↺ Repeat {'ON' if st.repeat else 'OFF'}")
-            elif key == curses.KEY_UP:
-                st.volume = min(100, st.volume + 5)
-                player.set_volume(st.volume)
-                st.set_status(f"🔊 Volume {st.volume}%")
-            elif key == curses.KEY_DOWN:
-                st.volume = max(0, st.volume - 5)
-                player.set_volume(st.volume)
-                st.set_status(f"🔊 Volume {st.volume}%")
-            elif key == curses.KEY_RIGHT:
-                player.seek(10)
-                st.set_status("⏩ +10s")
-            elif key == curses.KEY_LEFT:
-                player.seek(-10)
-                st.set_status("⏪ -10s")
-            elif key == ord("m"):
-                player.toggle_mute()
-                st.set_status("🔇 Mute toggled")
+                if st.history:              start_track(st.history.pop(), push=False)
+                elif st.current_idx > 0:    start_track(st.current_idx-1)
+            elif key == ord("p"):           player.pause_stream();  st.paused = True;  st.set_status(f"{CHARS['pause']}  paused")
+            elif key == ord("r"):           player.resume_stream(); st.paused = False; st.set_status(f"{CHARS['play']}  resumed")
+            elif key == ord("s"):           st.shuffle = not st.shuffle; st.set_status(f"{CHARS['shuffle_on']}  shuffle {'on' if st.shuffle else 'off'}")
+            elif key == ord("l"):           st.repeat  = not st.repeat;  st.set_status(f"{CHARS['repeat_on']}  repeat {'on' if st.repeat else 'off'}")
+            elif key == ord("m"):           st.muted = not st.muted; player.toggle_mute(); st.set_status(f"{CHARS['mute']}  {'muted' if st.muted else 'unmuted'}")
+            elif key == curses.KEY_UP:      st.volume = min(100, st.volume+5);  player.set_volume(st.volume); st.set_status(f"{CHARS['vol']}  {st.volume}%", 1.5)
+            elif key == curses.KEY_DOWN:    st.volume = max(0,   st.volume-5);  player.set_volume(st.volume); st.set_status(f"{CHARS['vol']}  {st.volume}%", 1.5)
+            elif key == curses.KEY_RIGHT:   player.seek(10);  st.set_status("⏩  +10 s", 1.0)
+            elif key == curses.KEY_LEFT:    player.seek(-10); st.set_status("⏪  −10 s", 1.0)
 
-        # ── Auto-advance when track ends ──
+        # Auto-advance
         if not st.paused and player.is_running():
             pos = player.get_position()
             dur = player.get_duration()
-            if pos is not None and dur and dur > 0 and dur - pos < 0.5:
-                if not last_track_end:
-                    last_track_end = True
-                    if st.repeat:
-                        start_track(st.current_idx, push_history=False)
-                    else:
-                        start_track(st.next_idx())
-            else:
-                last_track_end = False
+            near = pos is not None and dur and dur > 0 and (dur - pos) < 0.8
+            if near and not _end_armed:
+                _end_armed = True
+                start_track(st.current_idx if st.repeat else st.next_idx(),
+                             push=not st.repeat)
+            elif not near:
+                _end_armed = False
         elif not player.is_running() and not st.paused and st.queue:
-            # mpv died unexpectedly — advance
             start_track(st.next_idx())
 
-        # ── Draw Art ──
-        draw_border_titled(art_win, "ALBUM ART")
-        with art_lock:
-            if art_data["loading"]:
-                art_win.addstr(art_h // 2, (art_w // 2) - 6,
-                               f"{spinner[st.spin_idx % 10]}  Loading…",
-                               curses.A_DIM)
-            elif art_data["pixels"]:
-                draw_art(art_win, art_data["pixels"], art_data["w"], art_data["h"])
-            else:
-                art_win.addstr(art_h // 2, (art_w // 2) - 7,
-                               "  No Thumbnail  ", curses.A_DIM)
-        art_win.refresh()
-
-        # ── Draw Main Panel ──
-        if st.view == "player":
-            draw_player_panel(main_win, st, p_w, p_h, spinner)
-        else:
-            draw_queue_panel(main_win, st, p_w, p_h)
-
-        draw_footer(footer_win, width, st.view)
+        # Render
+        render_art_panel(art_win, st, art_w, art_h)
+        (render_player_panel if st.view == "player" else render_queue_panel)(
+            main_win, st, p_w, p_h)
+        render_footer(footer_win, width, st)
 
         st.spin_idx += 1
         curses.napms(100)
