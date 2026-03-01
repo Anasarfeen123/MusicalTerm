@@ -1,6 +1,6 @@
 """
 MusicalTerm — Terminal Music Player
-Aesthetic: Deep space obsidian / iridescent aurora accents
+Aesthetic: Dark obsidian / warm amber & rose accents
 """
 
 import curses
@@ -47,20 +47,19 @@ CHARS = {
 }
 
 # ─── Color Palette ────────────────────────────────────────────────────────────
-# Aurora/iridescent color cycle for animated accents
-AURORA_CYCLE = [51, 45, 39, 33, 27, 21, 57, 93, 129, 165, 201, 200, 199, 198, 197]
+# Static theme: warm amber / deep rose / slate
 
 # Color pair IDs
-C_ACCENT  = 1   # Primary accent (dynamic aurora color)
+C_ACCENT  = 1   # Primary accent — warm amber
 C_DIM     = 2   # Muted foreground
 C_WHITE   = 3   # Bright white
 C_GREEN   = 4   # Volume / progress fill
 C_TITLE   = 5   # Header title
 C_STATUS  = 6   # Status / warning
 C_QUEUE_H = 7   # Queue highlight
-C_ART_BG  = 8   # Art panel border
-C_CYAN    = 9   # Secondary accent
-C_MAGENTA = 10  # Tertiary accent
+C_ART_BG  = 8   # Art panel border (set per-album by dominant color)
+C_CYAN    = 9   # Secondary accent — rose/salmon
+C_MAGENTA = 10  # Tertiary accent — soft lavender
 
 # ─── Art State ────────────────────────────────────────────────────────────────
 art_lock = threading.Lock()
@@ -84,7 +83,6 @@ class State:
         self._status_msg    = ""
         self._status_ts     = 0
         self.spin_idx       = 0
-        self.aurora_phase   = 0
 
     def set_status(self, msg, ttl=3.0):
         self._status_msg = msg
@@ -109,9 +107,6 @@ class State:
                 return self.shuffle_pool.pop(0)
             return self.current_idx
         return (self.current_idx + 1) % len(self.queue)
-
-    def aurora_color(self):
-        return AURORA_CYCLE[self.aurora_phase % len(AURORA_CYCLE)]
 
 
 # ─── Art Loading ──────────────────────────────────────────────────────────────
@@ -209,12 +204,6 @@ def fmt_t(s):
     m, sec = divmod(int(s), 60)
     return f"{m:02}:{sec:02}"
 
-
-def update_aurora_pairs(st):
-    """Update the animated accent color pairs each tick."""
-    ac = st.aurora_color()
-    curses.init_pair(C_ACCENT, ac, -1)
-    curses.init_pair(C_TITLE,  ac, -1)
 
 
 # ─── URL Input Screen ─────────────────────────────────────────────────────────
@@ -325,7 +314,7 @@ def get_url_input(stdscr):
 def render_art_panel(win, st, art_w, art_h):
     win.erase()
     with art_lock:
-        dom_idx = art_data.get("dom_idx", st.aurora_color())
+        dom_idx = art_data.get("dom_idx", 214)
 
     border_color = curses.color_pair(C_ART_BG)
     dim          = curses.color_pair(C_DIM)
@@ -542,7 +531,6 @@ def render_header(win, banner, width, st):
         S(win, i, max(0, (width - len(line))//2), line, cp | curses.A_BOLD)
     win.refresh()
 
-
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def run_ui(stdscr):
@@ -552,17 +540,17 @@ def run_ui(stdscr):
     stdscr.nodelay(True)
     stdscr.keypad(True)
 
-    # Deep space / aurora theme
-    curses.init_pair(C_ACCENT,  51,  -1)   # Electric cyan
-    curses.init_pair(C_DIM,    238,  -1)   # Dark grey
+    # Static theme: warm amber / rose / lavender on deep dark
+    curses.init_pair(C_ACCENT,  214,  -1)   # Warm amber/gold
+    curses.init_pair(C_DIM,    238,  -1)   # Dark slate grey
     curses.init_pair(C_WHITE,  255,  -1)   # Bright white
-    curses.init_pair(C_GREEN,   84,  -1)   # Neon green
-    curses.init_pair(C_TITLE,   51,  -1)   # Electric cyan title
-    curses.init_pair(C_STATUS, 203,  -1)   # Warm red/orange
-    curses.init_pair(C_QUEUE_H, 51,  -1)   # Matches accent
-    curses.init_pair(C_ART_BG,  57,  -1)   # Deep indigo
-    curses.init_pair(C_CYAN,    87,  -1)   # Bright cyan
-    curses.init_pair(C_MAGENTA,201,  -1)   # Hot magenta
+    curses.init_pair(C_GREEN,  150,  -1)   # Soft sage green
+    curses.init_pair(C_TITLE,  214,  -1)   # Amber title
+    curses.init_pair(C_STATUS, 203,  -1)   # Warm coral for warnings
+    curses.init_pair(C_QUEUE_H,214,  -1)   # Matches accent
+    curses.init_pair(C_ART_BG,  94,  -1)   # Deep burnt orange for art border
+    curses.init_pair(C_CYAN,   216,  -1)   # Peach/rose secondary
+    curses.init_pair(C_MAGENTA,183,  -1)   # Soft lavender tertiary
 
     height, width = stdscr.getmaxyx()
     if height < 24 or width < 82:
@@ -581,7 +569,7 @@ def run_ui(stdscr):
     stdscr.clear()
     stdscr.refresh()
 
-    banner   = f_title.renderText("MT").splitlines()
+    banner   = f_title.renderText("MusicalTerm").splitlines()
     banner_h = len(banner) + 1
     art_w, art_h = 40, 20
     p_w  = min(width - art_w - 6, 58)
@@ -706,11 +694,6 @@ def run_ui(stdscr):
                 _end_armed = False
         elif not player.is_running() and not st.paused and st.queue:
             start_track(st.next_idx())
-
-        # Aurora animation tick
-        if st.spin_idx % 8 == 0:
-            st.aurora_phase = (st.aurora_phase + 1) % len(AURORA_CYCLE)
-            update_aurora_pairs(st)
 
         # Render
         render_header(header_win, banner, width, st)
