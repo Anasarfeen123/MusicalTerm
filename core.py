@@ -113,6 +113,24 @@ def download_thumbnail(url, save_path="cover.jpg"):
     return False
 
 
+def get_dominant_color(path):
+    try:
+        im = Image.open(path).convert("RGB")
+        im = im.resize((50, 50)) # Resize small for speed
+        pixels = list(im.getdata())
+        
+        # Simple frequency count, ignoring very dark/very light pixels
+        counts = {}
+        for r, g, b in pixels:
+            if 30 < (r + g + b) < 700: # Skip near-black and near-white
+                rgb = (r, g, b)
+                counts[rgb] = counts.get(rgb, 0) + 1
+        
+        if not counts: return (214, 214, 214) # Fallback to gold-ish
+        return max(counts, key=counts.get)
+    except:
+        return (214, 214, 214)
+
 # ─── Image → Pixel Matrix ────────────────────────────────────────────────────
 
 def get_album_art_matrix(path, size=30):
@@ -120,13 +138,14 @@ def get_album_art_matrix(path, size=30):
         if not os.path.exists(path):
             return None, 0, 0
 
-        im           = Image.open(path).convert("RGB")
-        aspect_ratio = im.height / im.width
-        new_width    = size
-        new_height   = max(1, int(aspect_ratio * new_width * 1.1))
-
+        im = Image.open(path).convert("RGB")
+        # For High-Def Half-Blocks, we want a 1:1 pixel aspect ratio 
+        # before the terminal stretches it.
+        new_width = size
+        new_height = size
+        
         im = im.resize((new_width, new_height), Image.Resampling.LANCZOS)
-        return list(im.getdata()), new_width, im.height
-
+        dom_color = get_dominant_color(path)
+        return list(im.getdata()), new_width, im.height, dom_color
     except Exception:
         return None, 0, 0

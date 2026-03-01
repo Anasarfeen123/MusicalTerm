@@ -23,8 +23,8 @@ CHARS = {
     "bar_empty":   "░",
     "vol_fill":    "▰",
     "vol_empty":   "▱",
-    "h_line":      "─",
-    "v_line":      "│",
+    "h_line":      "━",
+    "v_line":      "┃",
     "tl":          "╭",
     "tr":          "╮",
     "bl":          "╰",
@@ -93,14 +93,28 @@ class State:
 
 # ─── Art Loading ──────────────────────────────────────────────────────────────
 
+# ─── Art Loading ──────────────────────────────────────────────────────────────
+
 def _bg_load_art(url, art_width):
+    global art_data
     with art_lock:
         art_data["loading"] = True
-        art_data["pixels"]  = None
+        
+    # Attempt to download and process the art
     if core.download_thumbnail(url, "cover.jpg"):
-        px, w, h = core.get_album_art_matrix("cover.jpg", size=art_width - 4)
+        # core.get_album_art_matrix now returns (pixels, width, height, dominant_rgb)
+        px, w, h, dom_rgb = core.get_album_art_matrix("cover.jpg", size=art_width - 4)
+        
+        # Convert the RGB dominant color to an xterm 256 index
+        dom_idx = 16 + int(dom_rgb[0]/255*5)*36 + int(dom_rgb[1]/255*5)*6 + int(dom_rgb[2]/255*5)
+        
         with art_lock:
             art_data.update(pixels=px, w=w, h=h)
+            # Re-initialize UI color pairs with the new dominant accent color
+            curses.init_pair(C_GOLD, dom_idx, -1) 
+            curses.init_pair(C_TITLE, dom_idx, -1)
+            curses.init_pair(C_QUEUE_H, dom_idx, -1)
+            
     with art_lock:
         art_data["loading"] = False
 
@@ -110,32 +124,47 @@ def trigger_art_load(url, art_width):
 
 
 def draw_art(win, pixels, img_w, img_h):
+    """
+    Renders album art in High Definition using the Half-Block technique.
+    One character cell displays two vertical pixels.
+    """
     if not pixels:
         return
+
     def to256(r, g, b):
         return 16 + int(r/255*5)*36 + int(g/255*5)*6 + int(b/255*5)
-    cache, nxt = {}, 10
+
+    # Use a local cache for color pairs to maintain performance
+    cache, nxt = {}, 15 
+    
+    # Iterate through image rows two at a time
     for y in range(0, img_h - 1, 2):
         for x in range(img_w):
-            ti = y * img_w + x
-            bi = (y+1) * img_w + x
-            if ti >= len(pixels) or bi >= len(pixels):
+            idx_top = y * img_w + x
+            idx_bot = (y + 1) * img_w + x
+            
+            if idx_top >= len(pixels) or idx_bot >= len(pixels):
                 continue
-            r1,g1,b1 = pixels[ti]
-            r2,g2,b2 = pixels[bi]
-            fg, bg = to256(r1,g1,b1), to256(r2,g2,b2)
+
+            r1, g1, b1 = pixels[idx_top]
+            r2, g2, b2 = pixels[idx_bot]
+            
+            fg, bg = to256(r1, g1, b1), to256(r2, g2, b2)
             key = (fg, bg)
+
             if key not in cache:
                 if nxt < curses.COLOR_PAIRS:
                     curses.init_pair(nxt, fg, bg)
-                    cache[key] = nxt; nxt += 1
+                    cache[key] = nxt
+                    nxt += 1
                 else:
-                    cache[key] = 0
+                    cache[key] = 0 # Fallback
+            
             try:
-                win.addch((y//2)+1, x+1, "▀", curses.color_pair(cache[key]))
+                # '▀' represents the top pixel; background color represents the bottom
+                win.addch((y // 2) + 1, x + 1, "▀", curses.color_pair(cache[key]))
             except curses.error:
                 pass
-
 
 # ─── Primitives ───────────────────────────────────────────────────────────────
 
@@ -194,7 +223,18 @@ def render_art_panel(win, st, art_w, art_h):
     elif pixels:
         draw_art(win, pixels, iw, ih)
     else:
-        S(win, art_h//2, (art_w-14)//2, "  no thumbnail  ", dim | curses.A_DIM)
+        # Faux vinyl placeholder
+        center_y = art_h // 2
+        center_x = art_w // 2
+        radius = min(art_h, art_w) // 3
+
+        for y in range(1, art_h-1):
+            for x in range(1, art_w-1):
+                dy = y - center_y
+                dx = x - center_x
+                if dx*dx + dy*dy < radius*radius:
+                    S(win, y, x, "•", curses.color_pair(C_DIM))
+        S(win, center_y, center_x-3, "VINYL", curses.color_pair(C_GOLD) | curses.A_BOLD)
     win.refresh()
 
 
@@ -214,7 +254,8 @@ def render_player_panel(win, st, p_w, p_h):
     track   = st.queue[st.current_idx] if st.queue else None
     title   = track["title"] if track else "No track loaded"
     counter = f"{st.current_idx+1:02}/{len(st.queue):02}"
-    S(win, 2, 2, trunc(title, iw - len(counter) - 2), white | curses.A_BOLD)
+    display_title = f"❖ {trunc(title, iw - len(counter) - 6)}"
+    S(win, 2, 2, display_title, curses.color_pair(C_GOLD) | curses.A_BOLD)
     S(win, 2, p_w - len(counter) - 2, counter, dim)
 
     draw_hrule(win, 3, 0, p_w, gold)
@@ -259,10 +300,20 @@ def render_player_panel(win, st, p_w, p_h):
         prog   = min(1.0, elapsed / duration)
         bw     = iw - 2
         filled = round(prog * bw)
-        bar    = CHARS["bar_fill"]*filled + CHARS["bar_empty"]*(bw-filled)
+        pulse = (st.spin_idx % 6)
+        bar_chars = []
+        for i in range(bw):
+            if i < filled:
+                if i % 6 == pulse:
+                    bar_chars.append("▓")
+                else:
+                    bar_chars.append(CHARS["bar_fill"])
+            else:
+                bar_chars.append(CHARS["bar_empty"])
+        bar = "".join(bar_chars)
         tstr   = f"{fmt_t(elapsed)}  {CHARS['arrow']}  {fmt_t(duration)}"
         S(win, p_h-4, 2, tstr, dim)
-        S(win, p_h-3, 2, bar,  grn | curses.A_BOLD)
+        S(win, p_h-3, 2, bar, curses.color_pair(C_GOLD) | curses.A_BOLD)
         S(win, p_h-3, p_w - 5, f"{int(prog*100):3d}%", gold)
     else:
         sp = CHARS["spin"][st.spin_idx % 4]
@@ -297,7 +348,7 @@ def render_queue_panel(win, st, p_w, p_h):
         label  = trunc(st.queue[idx].get("title") or "Unknown", p_w - 8)
         is_cur = idx == st.current_idx
         if is_cur:
-            S(win, i+2, 1, f" {CHARS['bullet']} {label}", hl | curses.A_BOLD)
+            S(win, i+2, 1, f" {CHARS['bullet']} {label}", hl | curses.A_BOLD | curses.A_REVERSE)
         else:
             S(win, i+2, 1, f"{idx+1:3}. {label}", dim)
 
@@ -394,6 +445,8 @@ def run_ui(stdscr):
       curses.color_pair(C_DIM) | curses.A_DIM)
     stdscr.refresh()
 
+
+
     media = core.extract_media(
         "https://music.youtube.com/playlist?list=PLF09LSCsr9VMLI8WhNk9Mu7dYawruYBDi"
     )
@@ -464,7 +517,8 @@ def run_ui(stdscr):
                 _end_armed = False
         elif not player.is_running() and not st.paused and st.queue:
             start_track(st.next_idx())
-
+        if st.spin_idx % 20 == 0:
+            curses.init_pair(C_TITLE, 220 + (st.spin_idx % 2), -1)
         # Render
         render_art_panel(art_win, st, art_w, art_h)
         (render_player_panel if st.view == "player" else render_queue_panel)(
