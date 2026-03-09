@@ -1,5 +1,6 @@
 import os
 import contextlib
+from typing import Any, Dict, cast
 import yt_dlp
 import requests
 from PIL import Image
