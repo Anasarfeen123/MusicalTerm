@@ -12,19 +12,39 @@ import os
 import tempfile
 import math
 import re
+import json
+import textwrap
 from pyfiglet import Figlet
 import core
 import player
 
 # ─── Lyrics Parser ───────────────────────────────────────────────────────────
 
+LYRIC_LEAD_SECONDS = 0.8
+
 def parse_lyrics(raw):
     """
     Attempts to parse LRC, SRT, or VTT into a list of (start_time, text).
     """
     if not raw: return []
+
+    # 1. Try YouTube JSON3 captions.
+    try:
+        data = json.loads(raw)
+        json_lines = []
+        for event in data.get("events", []):
+            if "tStartMs" not in event:
+                continue
+            text = "".join(seg.get("utf8", "") for seg in event.get("segs", []))
+            text = " ".join(text.split())
+            if text:
+                json_lines.append((event["tStartMs"] / 1000, text))
+        if json_lines:
+            return sorted(json_lines, key=lambda x: x[0])
+    except (TypeError, ValueError, AttributeError):
+        pass
     
-    # 1. Try LRC format: [00:12.34] text
+    # 2. Try LRC format: [00:12.34] text
     lrc_pattern = re.compile(r'\[(\d+):(\d+\.?\d*)\](.*)')
     lrc_lines = []
     for line in raw.splitlines():
@@ -35,9 +55,12 @@ def parse_lyrics(raw):
     if lrc_lines:
         return sorted(lrc_lines, key=lambda x: x[0])
 
-    # 2. Try SRT/VTT format: 00:00:00.000 --> 00:00:02.000
+    # 3. Try SRT/VTT format: 00:00:00.000 --> 00:00:02.000
     # simplified: just find timestamps
-    time_pattern = re.compile(r'(\d{2}:\d{2}:\d{2}[\.,]\d{3}) --> (\d{2}:\d{2}:\d{2}[\.,]\d{3})')
+    time_pattern = re.compile(
+        r'(\d{2}:\d{2}:\d{2}[\.,]\d{3})\s+-->\s+'
+        r'(\d{2}:\d{2}:\d{2}[\.,]\d{3})(?:[^\n]*)'
+    )
     lines = []
     parts = re.split(time_pattern, raw)
     # parts[0] is header
@@ -57,7 +80,17 @@ def parse_lyrics(raw):
         if text:
             lines.append((start_time, text))
             
-    return sorted(lines, key=lambda x: x[0])
+    if lines:
+        return sorted(lines, key=lambda x: x[0])
+
+    # 4. Plain lyrics fallback. Give each non-empty line a stable synthetic
+    # timestamp so the lyrics panel can still render and scroll.
+    plain_lines = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if line:
+            plain_lines.append((len(plain_lines) * 4.0, line))
+    return plain_lines
 
 
 # ─── Fonts ────────────────────────────────────────────────────────────────────
@@ -357,7 +390,8 @@ PARTY_FLOATERS = ["★", "✦", "◈", "◉", "❋", "✿", "◆", "▲"]
 # ─── Art Loading ──────────────────────────────────────────────────────────────
 
 
-def _bg_load_art(url, art_w, art_h, st):
+def _bg_load_art(track, art_w, art_h, st, load_id):
+    url = track["url"]
     global art_data
     with art_lock:
         art_data["loading"] = True
@@ -371,15 +405,20 @@ def _bg_load_art(url, art_w, art_h, st):
     st.current_lyric_idx = -1
     
     # Fetch lyrics in background
-    raw_lyrics = core.fetch_lyrics(url)
-    if raw_lyrics:
+    raw_lyrics = core.fetch_lyrics(
+        url,
+        title=track.get("title"),
+        artist=track.get("uploader"),
+        duration=track.get("duration"),
+    )
+    if raw_lyrics and st.track_count == load_id:
         st.lyrics = parse_lyrics(raw_lyrics)
 
-    if core.download_thumbnail(url, cover_path):
+    if st.track_count == load_id and core.download_thumbnail(url, cover_path):
         px, w, h, dom_rgb = core.get_album_art_matrix(
             cover_path, max_w=art_w - 4, max_h=art_h - 4
         )
-        if px:
+        if px and st.track_count == load_id:
             indices = [to256(r, g, b) for r, g, b in px]
             dom_idx = to256(*dom_rgb)
             with art_lock:
@@ -387,12 +426,17 @@ def _bg_load_art(url, art_w, art_h, st):
                 art_data["pairs"] = {}
                 art_data["nxt_pair"] = 200
 
-    with art_lock:
-        art_data["loading"] = False
+    if st.track_count == load_id:
+        with art_lock:
+            art_data["loading"] = False
 
 
-def trigger_art_load(url, art_w, art_h, st):
-    threading.Thread(target=_bg_load_art, args=(url, art_w, art_h, st), daemon=True).start()
+def trigger_art_load(track, art_w, art_h, st):
+    threading.Thread(
+        target=_bg_load_art,
+        args=(track, art_w, art_h, st, st.track_count),
+        daemon=True,
+    ).start()
 
 
 def draw_album_art(win, st, art_w, art_h):
@@ -437,7 +481,7 @@ def draw_lyrics(win, st, art_w, art_h):
         S(win, win_h // 2, max(1, (art_w - 18) // 2), " No lyrics found. ", curses.color_pair(C_DIM))
         return
 
-    pos = player.get_position() or 0
+    pos = (player.get_position() or 0) + LYRIC_LEAD_SECONDS
     # Find current lyric
     idx = -1
     for i, (ts, text) in enumerate(st.lyrics):
@@ -445,6 +489,7 @@ def draw_lyrics(win, st, art_w, art_h):
             idx = i
         else:
             break
+    idx = max(0, idx)
     
     st.current_lyric_idx = idx
     
@@ -452,25 +497,56 @@ def draw_lyrics(win, st, art_w, art_h):
     white = curses.color_pair(C_WHITE)
     dim = curses.color_pair(C_DIM)
     
-    visible_lines = win_h - 4
-    start_y = 2
-    
-    # Show a few lines before and after
-    offset = max(0, idx - (visible_lines // 2))
-    for i in range(visible_lines):
-        curr = offset + i
-        if curr >= len(st.lyrics):
+    max_text_w = max(8, min(art_w, win_w) - 7)
+    visible = []
+    first = max(0, idx - 2)
+    last = min(len(st.lyrics), idx + 3)
+
+    for curr in range(first, last):
+        _, text = st.lyrics[curr]
+        max_lines = 2 if curr == idx else 1
+        wrapped = _lyric_display_lines(text, max_text_w, max_lines)
+        visible.append((curr, wrapped))
+
+    total_rows = sum(len(lines) for _, lines in visible) + max(0, len(visible) - 1)
+    start_y = max(2, (win_h - total_rows) // 2)
+    y = start_y
+
+    for curr, lines in visible:
+        if y >= win_h - 1:
             break
-        
-        ts, text = st.lyrics[curr]
-        ry = start_y + i
         attr = white | curses.A_BOLD if curr == idx else dim
         if curr == idx:
             # Highlight current line
-            S(win, ry, 2, f"{CHARS['arrow']} ", accent)
-            S(win, ry, 4, trunc(text, art_w - 6), attr)
+            S(win, y, 2, f"{CHARS['arrow']} ", accent)
+
+        for line_idx, line in enumerate(lines):
+            if y >= win_h - 1:
+                break
+            prefix_x = 4 if curr == idx and line_idx == 0 else 5
+            S(win, y, prefix_x, line, attr)
+            y += 1
+        y += 1
+
+
+def _lyric_display_lines(text, width, max_lines):
+    text = " ".join((text or "").split())
+    if not text:
+        return []
+    lines = textwrap.wrap(
+        text,
+        width=max(1, width),
+        break_long_words=False,
+        break_on_hyphens=False,
+    )
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        ellipsis = "…"
+        if width <= len(ellipsis):
+            lines[-1] = ellipsis
         else:
-            S(win, ry, 4, trunc(text, art_w - 6), attr)
+            lines[-1] = trunc(lines[-1], width - len(ellipsis)) + ellipsis
+    return lines or [trunc(text, width)]
 
 
 def draw_dancer(win, st):
@@ -1477,10 +1553,10 @@ def run_ui(stdscr):
         if idx in st.shuffle_pool:
             st.shuffle_pool.remove(idx)
         track = st.queue[idx]
+        trigger_art_load(track, art_w, art_h, st)
         player.play_stream(track["url"])
         player.set_volume(st.volume)
         st.paused = False
-        trigger_art_load(track["url"], art_w, art_h, st)
         st.set_status(f"{CHARS['play']}  {trunc(track['title'] or '…', 40)}")
         
         # Update MPRIS
@@ -1499,6 +1575,7 @@ def run_ui(stdscr):
     else:
         start_track(0, push=False)
     _end_armed = False
+    _last_end_check = 0.0
 
     while True:
         key = stdscr.getch()
@@ -1680,20 +1757,20 @@ def run_ui(stdscr):
                 st.set_status("⏪  −10 s", 1.0)
 
         # ── Auto-advance ──
-        if not st.paused and player.is_running():
-            pos = player.get_position()
-            dur = player.get_duration()
-            # If we are near the end, or mpv has become idle (finished track)
-            near = pos is not None and dur and dur > 0 and (dur - pos) < 1.0
-            idle = player.is_idle()
-            
-            if (near or idle) and not _end_armed:
+        now = time.time()
+        if not st.paused and player.is_running() and now - _last_end_check >= 1.0:
+            _last_end_check = now
+            # Stream durations can be inaccurate, so only advance after mpv
+            # reports the file has actually ended.
+            ended = player.eof_reached() or player.is_idle()
+
+            if ended and not _end_armed:
                 _end_armed = True
                 start_track(
                     st.current_idx if st.repeat else st.next_idx(),
                     push=not st.repeat,
                 )
-            elif not near and not idle:
+            elif not ended:
                 _end_armed = False
         elif not player.is_running() and not st.paused and st.queue:
             # If it's not running and not paused, it must have exited at the end

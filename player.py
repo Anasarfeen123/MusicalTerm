@@ -204,6 +204,7 @@ def get_position():  return _get("time-pos")
 def get_duration():  return _get("duration")
 def get_volume():    return _get("volume")
 def is_muted():      return _muted
+def eof_reached():   return _get("eof-reached") is True
 
 
 def is_idle():
