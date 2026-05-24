@@ -165,6 +165,35 @@ class State:
         self.queue_cursor = self.current_idx
 
 
+# ─── Animation Data ───────────────────────────────────────────────────────────
+DANCER_FRAMES = [
+    [
+        "   o   ",
+        "  /|\\  ",
+        "  / \\  "
+    ],
+    [
+        "  \\o/  ",
+        "   |   ",
+        "  / \\  "
+    ],
+    [
+        "  _o_  ",
+        " / | \\ ",
+        "  / \\  "
+    ],
+    [
+        "   o   ",
+        "  /|\\_ ",
+        "  /    "
+    ],
+    [
+        "  _o   ",
+        "   |\\  ",
+        "  / \\  "
+    ]
+]
+
 # ─── Art Loading ──────────────────────────────────────────────────────────────
 
 def _bg_load_art(url, art_w, art_h):
@@ -192,46 +221,52 @@ def trigger_art_load(url, art_w, art_h):
     threading.Thread(target=_bg_load_art, args=(url, art_w, art_h), daemon=True).start()
 
 
-def draw_art(win, indices, img_w, img_h):
-    """Renders album art using the Half-Block technique with persistent caching."""
-    if not indices:
-        return
-
+def draw_art(win, indices, img_w, img_h, st=None):
+    """Renders a dancing ASCII character tinted with the album's dominant color."""
     win_h, win_w = win.getmaxyx()
-    start_y = max(1, (win_h - (img_h // 2)) // 2)
-    start_x = max(1, (win_w - img_w) // 2)
-
-    with art_lock:
-        cache = art_data["pairs"]
-        nxt   = art_data["nxt_pair"]
-
-    for y in range(0, img_h - 1, 2):
-        for x in range(img_w):
-            idx_top = y * img_w + x
-            idx_bot = (y + 1) * img_w + x
-            if idx_top >= len(indices) or idx_bot >= len(indices):
-                continue
-            
-            fg, bg = indices[idx_top], indices[idx_bot]
-            key = (fg, bg)
-            if key not in cache:
-                if nxt < 3000: # Safe limit for most terminals
-                    try:
-                        curses.init_pair(nxt, fg, bg)
-                        cache[key] = nxt
-                        nxt += 1
-                    except:
-                        cache[key] = 0
-                else:
-                    cache[key] = 0
-            
-            try:
-                win.addch(start_y + (y // 2), start_x + x, "▀", curses.color_pair(cache.get(key, 0)))
-            except:
-                pass
     
     with art_lock:
-        art_data["nxt_pair"] = nxt
+        dom_idx = art_data.get("dom_idx", 214)
+    
+    accent = curses.color_pair(C_ART_BG)
+    dim = curses.color_pair(C_DIM)
+    
+    # Calculate animation frame based on state spin index
+    frame_idx = (st.spin_idx // 2) % len(DANCER_FRAMES) if st else 0
+    frame = DANCER_FRAMES[frame_idx]
+    
+    fh = len(frame)
+    fw = len(frame[0])
+    
+    start_y = (win_h - fh) // 2
+    start_x = (win_w - fw) // 2
+    
+    # Draw a small "stage" or glow
+    for dy in range(-1, fh + 1):
+        for dx in range(-4, fw + 4):
+            if 0 < start_y + dy < win_h - 1 and 0 < start_x + dx < win_w - 1:
+                if dy == fh:
+                    S(win, start_y + dy, start_x + dx, "▔", dim)
+                elif dy >= 0 and dy < fh:
+                    # Subtle background aura using dominant color
+                    if random.random() > 0.92:
+                        S(win, start_y + dy, start_x + dx, "·", dim)
+
+    # Draw the dancer
+    for i, line in enumerate(frame):
+        # We can alternate colors for a "disco" effect if we want, 
+        # but let's stick to the dominant accent first.
+        attr = accent | curses.A_BOLD
+        if i == 0: attr |= curses.A_REVERSE # Head highlight
+        S(win, start_y + i, start_x, line, attr)
+    
+    # Add some "musical notes" popping up
+    notes = ["♪", "♫", "♩", "♬"]
+    if st and st.spin_idx % 4 == 0:
+        ny = start_y - 1 - (st.spin_idx % 3)
+        nx = start_x + (st.spin_idx % fw)
+        if 0 < ny < win_h:
+            S(win, ny, nx, random.choice(notes), accent)
 
 
 # ─── Primitives ───────────────────────────────────────────────────────────────
@@ -512,7 +547,7 @@ def render_art_panel(win, st, art_w, art_h):
         sp = CHARS["spin"][st.spin_idx % 4]
         S(win, art_h//2, (art_w-12)//2, f" {sp}  loading… ", dim)
     elif pixels:
-        draw_art(win, pixels, iw, ih)
+        draw_art(win, pixels, iw, ih, st)
     else:
         # ─── Improved Vinyl Aesthetic ───
         cy, cx = art_h // 2, art_w // 2
