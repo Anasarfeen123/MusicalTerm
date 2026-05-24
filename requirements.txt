@@ -2,3 +2,5 @@ yt_dlp
 pyfiglet
 colorama
 Pillow
+dbus-python
+PyGObject

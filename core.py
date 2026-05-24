@@ -17,17 +17,26 @@ def normalize_youtube_url(url):
 
 def is_probable_url(value):
     value = (value or "").strip().lower()
-    return value.startswith(("http://", "https://")) or "youtube.com/" in value or "youtu.be/" in value
+    if value.startswith(("http://", "https://")):
+        return True
+    if any(p in value for p in ["youtube.com/", "youtu.be/", "music.youtube.com/"]):
+        return True
+    return False
+
+
+def is_local_path(value):
+    return os.path.exists(os.path.expanduser(value))
 
 
 def media_query(value):
     """
-    Accept either a YouTube URL or a plain search query.
-    Plain queries use yt-dlp's YouTube search extractor.
+    Accept either a YouTube URL, a local path, or a plain search query.
     """
     value = (value or "").strip()
     if is_probable_url(value):
         return normalize_youtube_url(value)
+    if is_local_path(value):
+        return os.path.expanduser(value)
     return f"ytsearch12:{value}"
 
 
@@ -49,6 +58,11 @@ _BASE_OPTS = {
 # ─── Stream Resolution ────────────────────────────────────────────────────────
 
 def resolve_stream(url):
+    if is_local_path(url):
+        # For local files, the URL is the path itself.
+        # We can try to get metadata using yt-dlp or just return basics.
+        return os.path.basename(url), None, url
+
     url  = normalize_youtube_url(url)
     opts = {
         **_BASE_OPTS,
@@ -73,9 +87,41 @@ def resolve_stream(url):
 def extract_media(url):
     """
     Returns:
-        {type: "video"|"playlist", title: str, tracks: [{title, url}]}
+        {type: "video"|"playlist"|"local", title: str, tracks: [{title, url}]}
     """
     source = media_query(url)
+    
+    if is_local_path(source):
+        path = os.path.abspath(source)
+        if os.path.isdir(path):
+            tracks = []
+            for root, _, files in os.walk(path):
+                for f in sorted(files):
+                    if f.lower().endswith((".mp3", ".m4a", ".wav", ".flac", ".ogg", ".opus")):
+                        full_path = os.path.join(root, f)
+                        tracks.append({
+                            "title": f,
+                            "url": full_path,
+                            "duration": None,
+                            "uploader": "Local File",
+                        })
+            return {
+                "type": "playlist",
+                "title": os.path.basename(path),
+                "tracks": tracks
+            }
+        else:
+            return {
+                "type": "local",
+                "title": os.path.basename(path),
+                "tracks": [{
+                    "title": os.path.basename(path),
+                    "url": path,
+                    "duration": None,
+                    "uploader": "Local File",
+                }]
+            }
+
     url  = normalize_youtube_url(source)
     opts = {**_BASE_OPTS, "skip_download": True, "extract_flat": True, "noplaylist": False}
 
@@ -115,6 +161,18 @@ def extract_media(url):
 # ─── Thumbnail Download ───────────────────────────────────────────────────────
 
 def download_thumbnail(url, save_path="cover.jpg"):
+    if is_local_path(url):
+        # For local files, we could try to extract embedded art, 
+        # but for now let's just return False or look for cover.jpg in the same dir.
+        dir_path = os.path.dirname(url)
+        for name in ["cover.jpg", "cover.png", "folder.jpg", "folder.png"]:
+            p = os.path.join(dir_path, name)
+            if os.path.exists(p):
+                import shutil
+                shutil.copy(p, save_path)
+                return True
+        return False
+
     url  = normalize_youtube_url(url)
     opts = {**_BASE_OPTS, "skip_download": True, "extract_flat": False}
 
@@ -137,6 +195,58 @@ def download_thumbnail(url, save_path="cover.jpg"):
         pass
 
     return False
+
+
+# ─── Lyrics Extraction ────────────────────────────────────────────────────────
+
+def fetch_lyrics(url):
+    """
+    Fetches synced lyrics (subtitles) if available.
+    Returns a list of (timestamp, text) or None.
+    """
+    if is_local_path(url):
+        # Look for .lrc file
+        base = os.path.splitext(url)[0]
+        for ext in [".lrc", ".srt", ".vtt"]:
+            p = base + ext
+            if os.path.exists(p):
+                # Simple parser for now
+                try:
+                    with open(p, "r") as f:
+                        return f.read() # Return raw for now, parse in UI
+                except:
+                    pass
+        return None
+
+    url = normalize_youtube_url(url)
+    opts = {
+        **_BASE_OPTS,
+        "skip_download": True,
+        "writesubtitles": True,
+        "writeautomaticsub": True,
+        "subtitleslangs": ["en.*", ".*"],
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            
+        subs = info.get("requested_subtitles")
+        if not subs:
+            # Try manual subtitles
+            subs = info.get("subtitles")
+        
+        if subs:
+            # Pick first available subtitle
+            lang = list(subs.keys())[0]
+            sub_url = subs[lang].get("url")
+            if sub_url:
+                resp = requests.get(sub_url, timeout=10)
+                if resp.status_code == 200:
+                    return resp.text
+    except Exception:
+        pass
+    return None
 
 
 def get_dominant_color(path):

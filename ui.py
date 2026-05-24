@@ -11,15 +11,60 @@ import time
 import os
 import tempfile
 import math
+import re
 from pyfiglet import Figlet
 import core
 import player
 
+# ─── Lyrics Parser ───────────────────────────────────────────────────────────
+
+def parse_lyrics(raw):
+    """
+    Attempts to parse LRC, SRT, or VTT into a list of (start_time, text).
+    """
+    if not raw: return []
+    
+    # 1. Try LRC format: [00:12.34] text
+    lrc_pattern = re.compile(r'\[(\d+):(\d+\.?\d*)\](.*)')
+    lrc_lines = []
+    for line in raw.splitlines():
+        match = lrc_pattern.search(line)
+        if match:
+            m, s, txt = match.groups()
+            lrc_lines.append((int(m) * 60 + float(s), txt.strip()))
+    if lrc_lines:
+        return sorted(lrc_lines, key=lambda x: x[0])
+
+    # 2. Try SRT/VTT format: 00:00:00.000 --> 00:00:02.000
+    # simplified: just find timestamps
+    time_pattern = re.compile(r'(\d{2}:\d{2}:\d{2}[\.,]\d{3}) --> (\d{2}:\d{2}:\d{2}[\.,]\d{3})')
+    lines = []
+    parts = re.split(time_pattern, raw)
+    # parts[0] is header
+    # parts[1] is start, parts[2] is end, parts[3] is text
+    for i in range(1, len(parts), 3):
+        start_str = parts[i].replace(',', '.')
+        # convert HH:MM:SS.mmm to seconds
+        h, m, s = start_str.split(':')
+        start_time = int(h) * 3600 + int(m) * 60 + float(s)
+        
+        text = parts[i+2].strip()
+        # Clean up tags like <c> or 00:00:00.000
+        text = re.sub(r'<[^>]+>', '', text)
+        text = re.sub(r'\d{2}:\d{2}:\d{2}[\.,]\d{3}', '', text)
+        text = "\n".join([l for l in text.splitlines() if l.strip() and "-->" not in l])
+        
+        if text:
+            lines.append((start_time, text))
+            
+    return sorted(lines, key=lambda x: x[0])
+
+
 # ─── Fonts ────────────────────────────────────────────────────────────────────
 try:
-    f_title = Figlet(font="banner3-D")
+    f_title = Figlet(font="slant")
 except Exception:
-    f_title = Figlet(font="banner")
+    f_title = Figlet(font="small")
 
 # ─── Design Tokens ────────────────────────────────────────────────────────────
 CHARS = {
@@ -149,6 +194,28 @@ art_data = {
 }
 
 
+def get_art_pair(fg, bg):
+    global art_data
+    key = (fg, bg)
+    if key in art_data["pairs"]:
+        return art_data["pairs"][key]
+
+    pair_id = art_data["nxt_pair"]
+    # Curses usually supports 256 color pairs by default, but can be more.
+    # We limit to 255 to be safe if COLOR_PAIRS is small.
+    if pair_id >= getattr(curses, "COLOR_PAIRS", 256) - 1:
+        # Recycle pairs if we run out? For now just fallback.
+        return 0
+
+    try:
+        curses.init_pair(pair_id, fg, bg)
+        art_data["pairs"][key] = pair_id
+        art_data["nxt_pair"] += 1
+        return pair_id
+    except Exception:
+        return 0
+
+
 # ─── State ────────────────────────────────────────────────────────────────────
 class State:
     def __init__(self):
@@ -163,6 +230,7 @@ class State:
         self.shuffle = False
         self.muted = False
         self.view = "player"
+        self.art_mode = "art"  # art, dancer, lyrics
         self.queue_offset = 0
         self.filter_text = ""
         self.filter_mode = False
@@ -178,6 +246,8 @@ class State:
         self.party_mode = False  # NEW: rainbow / party mode
         self.show_eq = True  # NEW: show EQ bars in art panel
         self.track_count = 0  # NEW: how many tracks played this session
+        self.lyrics = []
+        self.current_lyric_idx = -1
 
     def set_status(self, msg, ttl=3.0):
         self._status_msg = msg
@@ -287,7 +357,7 @@ PARTY_FLOATERS = ["★", "✦", "◈", "◉", "❋", "✿", "◆", "▲"]
 # ─── Art Loading ──────────────────────────────────────────────────────────────
 
 
-def _bg_load_art(url, art_w, art_h):
+def _bg_load_art(url, art_w, art_h, st):
     global art_data
     with art_lock:
         art_data["loading"] = True
@@ -295,6 +365,16 @@ def _bg_load_art(url, art_w, art_h):
     cover_path = os.path.join(
         tempfile.gettempdir(), f"musicalterm_cover_{os.getpid()}.jpg"
     )
+    
+    # Reset lyrics
+    st.lyrics = []
+    st.current_lyric_idx = -1
+    
+    # Fetch lyrics in background
+    raw_lyrics = core.fetch_lyrics(url)
+    if raw_lyrics:
+        st.lyrics = parse_lyrics(raw_lyrics)
+
     if core.download_thumbnail(url, cover_path):
         px, w, h, dom_rgb = core.get_album_art_matrix(
             cover_path, max_w=art_w - 4, max_h=art_h - 4
@@ -311,8 +391,86 @@ def _bg_load_art(url, art_w, art_h):
         art_data["loading"] = False
 
 
-def trigger_art_load(url, art_w, art_h):
-    threading.Thread(target=_bg_load_art, args=(url, art_w, art_h), daemon=True).start()
+def trigger_art_load(url, art_w, art_h, st):
+    threading.Thread(target=_bg_load_art, args=(url, art_w, art_h, st), daemon=True).start()
+
+
+def draw_album_art(win, st, art_w, art_h):
+    win_h, win_w = win.getmaxyx()
+    with art_lock:
+        pixels = art_data.get("pixels")
+        w = art_data.get("w", 0)
+        h = art_data.get("h", 0)
+
+    if not pixels or w == 0 or h == 0:
+        draw_dancer(win, st)
+        return
+
+    # Center the image
+    start_y = max(1, (win_h - (h // 2)) // 2)
+    start_x = max(1, (win_w - w) // 2)
+
+    # Use half-blocks to render
+    # Each row in terminal is 2 pixels high in the image
+    for y in range(0, h - 1, 2):
+        ry = start_y + (y // 2)
+        if ry >= win_h - 1:
+            break
+        for x in range(w):
+            rx = start_x + x
+            if rx >= win_w - 1:
+                break
+            
+            top_color = pixels[y * w + x]
+            bot_color = pixels[(y + 1) * w + x]
+            
+            pair = get_art_pair(top_color, bot_color)
+            S(win, ry, rx, "▀", curses.color_pair(pair))
+
+
+def draw_lyrics(win, st, art_w, art_h):
+    """
+    Draws the synced lyrics.
+    """
+    win_h, win_w = win.getmaxyx()
+    if not st.lyrics:
+        S(win, win_h // 2, max(1, (art_w - 18) // 2), " No lyrics found. ", curses.color_pair(C_DIM))
+        return
+
+    pos = player.get_position() or 0
+    # Find current lyric
+    idx = -1
+    for i, (ts, text) in enumerate(st.lyrics):
+        if ts <= pos:
+            idx = i
+        else:
+            break
+    
+    st.current_lyric_idx = idx
+    
+    accent = curses.color_pair(C_ACCENT)
+    white = curses.color_pair(C_WHITE)
+    dim = curses.color_pair(C_DIM)
+    
+    visible_lines = win_h - 4
+    start_y = 2
+    
+    # Show a few lines before and after
+    offset = max(0, idx - (visible_lines // 2))
+    for i in range(visible_lines):
+        curr = offset + i
+        if curr >= len(st.lyrics):
+            break
+        
+        ts, text = st.lyrics[curr]
+        ry = start_y + i
+        attr = white | curses.A_BOLD if curr == idx else dim
+        if curr == idx:
+            # Highlight current line
+            S(win, ry, 2, f"{CHARS['arrow']} ", accent)
+            S(win, ry, 4, trunc(text, art_w - 6), attr)
+        else:
+            S(win, ry, 4, trunc(text, art_w - 6), attr)
 
 
 def draw_dancer(win, st):
@@ -642,6 +800,7 @@ def render_help_overlay(stdscr, st):
         ("M", "mute / unmute"),
         ("F", "favorite track"),
         ("A", "show all / favorites only"),
+        ("V", f"cycle view (art/dance/lyrics)"),
         ("E", "toggle EQ bars"),
         ("Z", "party mode  ★"),
         ("T", f"next theme  (current: {THEMES[st.theme_idx % len(THEMES)]['name']})"),
@@ -814,7 +973,13 @@ def render_art_panel(win, st, art_w, art_h):
         border_color = curses.color_pair(party_colors[st.spin_idx % len(party_colors)])
 
     draw_box(win, art_h, art_w, border_color)
-    panel_label(win, "A L B U M", art_w, border_color)
+    
+    mode_labels = {
+        "art": "A L B U M",
+        "dancer": "D A N C E R",
+        "lyrics": "L Y R I C S"
+    }
+    panel_label(win, mode_labels.get(st.art_mode, "A L B U M"), art_w, border_color)
 
     # Party mode label
     if st.party_mode:
@@ -822,18 +987,26 @@ def render_art_panel(win, st, art_w, art_h):
 
     with art_lock:
         loading = art_data["loading"]
-        pixels = art_data["pixels"]
 
     if loading:
         sp = CHARS["spin"][st.spin_idx % 4]
         S(win, art_h // 2, max(1, (art_w - 12) // 2), f" {sp}  loading… ", dim)
-        # Still show dancer while loading
-        draw_dancer(win, st)
+        if st.art_mode == "lyrics":
+            draw_lyrics(win, st, art_w, art_h)
+        elif st.art_mode == "art":
+            draw_album_art(win, st, art_w, art_h)
+        else:
+            draw_dancer(win, st)
     else:
-        draw_dancer(win, st)
+        if st.art_mode == "lyrics":
+            draw_lyrics(win, st, art_w, art_h)
+        elif st.art_mode == "art":
+            draw_album_art(win, st, art_w, art_h)
+        else:
+            draw_dancer(win, st)
 
     # EQ mode label
-    if st.show_eq and not st.paused:
+    if st.show_eq and not st.paused and st.art_mode != "lyrics":
         eq_label = "EQ ▂▃▅▄▂"
         S(
             win,
@@ -1135,9 +1308,8 @@ def render_footer(win, width, st):
             ("Q", "quit"),
             ("Space", "play"),
             ("N", "next"),
-            ("B", "back"),
+            ("V", "view"),
             ("S", "shuffle"),
-            ("F", "fav"),
             ("Z", "party"),
             ("T", "theme"),
             ("↑↓", "vol"),
@@ -1148,7 +1320,7 @@ def render_footer(win, width, st):
         compact_keys = [
             ("Q", "quit"),
             ("Space", "play"),
-            ("N", "next"),
+            ("V", "view"),
             ("Z", "party"),
             ("TAB", "queue"),
             ("?", "help"),
@@ -1308,10 +1480,24 @@ def run_ui(stdscr):
         player.play_stream(track["url"])
         player.set_volume(st.volume)
         st.paused = False
-        trigger_art_load(track["url"], art_w, art_h)
+        trigger_art_load(track["url"], art_w, art_h, st)
         st.set_status(f"{CHARS['play']}  {trunc(track['title'] or '…', 40)}")
+        
+        # Update MPRIS
+        if player._HAS_MPRIS:
+            import mpris
+            mpris.update_mpris_metadata(track)
+            mpris.update_mpris_status("Playing")
 
-    start_track(0, push=False)
+    # MPRIS Callbacks
+    player.on_next = lambda: start_track(st.next_idx())
+    player.on_prev = lambda: start_track(st.history.pop() if st.history else st.current_idx - 1, push=False)
+
+    if media["type"] in ("playlist", "search"):
+        st.view = "queue"
+        st.set_status("Select a track to start playback")
+    else:
+        start_track(0, push=False)
     _end_armed = False
 
     while True:
@@ -1347,6 +1533,13 @@ def run_ui(stdscr):
             st.view = "queue" if st.view == "player" else "player"
             if st.view == "queue":
                 st.sync_cursor_to_current()
+
+        # NEW: Art mode cycle
+        elif char == "v":
+            modes = ["art", "dancer", "lyrics"]
+            idx = modes.index(st.art_mode)
+            st.art_mode = modes[(idx + 1) % len(modes)]
+            st.set_status(f"view: {st.art_mode}")
 
         # NEW: Party mode toggle
         elif char == "z":
@@ -1490,16 +1683,20 @@ def run_ui(stdscr):
         if not st.paused and player.is_running():
             pos = player.get_position()
             dur = player.get_duration()
-            near = pos is not None and dur and dur > 0 and (dur - pos) < 0.8
-            if near and not _end_armed:
+            # If we are near the end, or mpv has become idle (finished track)
+            near = pos is not None and dur and dur > 0 and (dur - pos) < 1.0
+            idle = player.is_idle()
+            
+            if (near or idle) and not _end_armed:
                 _end_armed = True
                 start_track(
                     st.current_idx if st.repeat else st.next_idx(),
                     push=not st.repeat,
                 )
-            elif not near:
+            elif not near and not idle:
                 _end_armed = False
         elif not player.is_running() and not st.paused and st.queue:
+            # If it's not running and not paused, it must have exited at the end
             start_track(st.next_idx())
 
         # ── Render ──

@@ -5,11 +5,21 @@ import os
 import time
 import core
 
+try:
+    import mpris
+    _HAS_MPRIS = True
+except ImportError:
+    _HAS_MPRIS = False
+
 MPV_SOCKET = f"/tmp/mpvsocket_{os.getpid()}"
 
 _mpv_process = None
 _ipc_socket  = None
 _muted       = False
+
+# MPRIS Callbacks
+on_next = lambda: None
+on_prev = lambda: None
 
 
 # ─── IPC ──────────────────────────────────────────────────────────────────────
@@ -99,6 +109,7 @@ def play_stream(url):
         f"--input-ipc-server={MPV_SOCKET}",
         "--msg-level=all=no",
         "--volume=70",
+        "--idle=no",
         stream_url,
     ]
 
@@ -115,6 +126,9 @@ def play_stream(url):
 
 def stop_stream():
     global _ipc_socket, _mpv_process
+
+    if _HAS_MPRIS:
+        mpris.update_mpris_status("Stopped")
 
     try:
         _send_command({"command": ["quit"]})
@@ -149,11 +163,15 @@ def is_running():
 def pause_stream():
     _ensure_connected()
     _send_command({"command": ["set_property", "pause", True]})
+    if _HAS_MPRIS:
+        mpris.update_mpris_status("Paused")
 
 
 def resume_stream():
     _ensure_connected()
     _send_command({"command": ["set_property", "pause", False]})
+    if _HAS_MPRIS:
+        mpris.update_mpris_status("Playing")
 
 
 def seek(seconds):
@@ -186,3 +204,17 @@ def get_position():  return _get("time-pos")
 def get_duration():  return _get("duration")
 def get_volume():    return _get("volume")
 def is_muted():      return _muted
+
+
+def is_idle():
+    """Returns True if mpv is alive but not playing anything."""
+    _ensure_connected()
+    return _get("idle-active") is True
+
+
+# ─── Initialize ───────────────────────────────────────────────────────────────
+
+if _HAS_MPRIS:
+    import sys
+    # Pass this module to MPRIS so it can call our functions
+    mpris.start_mpris(sys.modules[__name__])
