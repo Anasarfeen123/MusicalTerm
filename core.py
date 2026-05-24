@@ -15,6 +15,22 @@ def normalize_youtube_url(url):
     return url
 
 
+def is_probable_url(value):
+    value = (value or "").strip().lower()
+    return value.startswith(("http://", "https://")) or "youtube.com/" in value or "youtu.be/" in value
+
+
+def media_query(value):
+    """
+    Accept either a YouTube URL or a plain search query.
+    Plain queries use yt-dlp's YouTube search extractor.
+    """
+    value = (value or "").strip()
+    if is_probable_url(value):
+        return normalize_youtube_url(value)
+    return f"ytsearch12:{value}"
+
+
 # ─── Shared ydl opts ─────────────────────────────────────────────────────────
 
 _BASE_OPTS = {
@@ -59,8 +75,9 @@ def extract_media(url):
     Returns:
         {type: "video"|"playlist", title: str, tracks: [{title, url}]}
     """
-    url  = normalize_youtube_url(url)
-    opts = {**_BASE_OPTS, "skip_download": True, "extract_flat": True}
+    source = media_query(url)
+    url  = normalize_youtube_url(source)
+    opts = {**_BASE_OPTS, "skip_download": True, "extract_flat": True, "noplaylist": False}
 
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -70,16 +87,24 @@ def extract_media(url):
             tracks = [
                 {
                     "title": e.get("title") or "Unknown",
-                    "url":   e.get("url") or e.get("webpage_url"),
+                    "url":   e.get("webpage_url") or e.get("url"),
+                    "duration": e.get("duration"),
+                    "uploader": e.get("uploader") or e.get("channel"),
                 }
                 for e in info["entries"] if e
             ]
-            return {"type": "playlist", "title": info.get("title"), "tracks": tracks}
+            media_type = "search" if source.startswith("ytsearch") else "playlist"
+            return {"type": media_type, "title": info.get("title") or url, "tracks": tracks}
 
         return {
             "type":   "video",
             "title":  info.get("title"),
-            "tracks": [{"title": info.get("title"), "url": url}],
+            "tracks": [{
+                "title": info.get("title"),
+                "url": url,
+                "duration": info.get("duration"),
+                "uploader": info.get("uploader") or info.get("channel"),
+            }],
         }
 
     except Exception as e:
@@ -117,36 +142,48 @@ def download_thumbnail(url, save_path="cover.jpg"):
 def get_dominant_color(path):
     try:
         im = Image.open(path).convert("RGB")
-        im = im.resize((50, 50)) # Resize small for speed
+        im.thumbnail((100, 100))
         pixels = list(im.getdata())
         
-        # Simple frequency count, ignoring very dark/very light pixels
         counts = {}
         for r, g, b in pixels:
-            if 30 < (r + g + b) < 700: # Skip near-black and near-white
+            # Boost saturation for dominant color detection
+            if 40 < (r + g + b) < 700:
                 rgb = (r, g, b)
                 counts[rgb] = counts.get(rgb, 0) + 1
         
-        if not counts: return (214, 214, 214) # Fallback to gold-ish
+        if not counts: return (214, 214, 214)
         return max(counts, key=counts.get)
     except:
         return (214, 214, 214)
 
 # ─── Image → Pixel Matrix ────────────────────────────────────────────────────
 
-def get_album_art_matrix(path, size=30):
+def get_album_art_matrix(path, max_w=40, max_h=20):
+    """
+    Returns a pixel matrix optimized for terminal half-blocks.
+    Half-blocks are 1 char wide and 0.5 char high.
+    To get a square image in terminal, we need width = 2 * height (in pixels).
+    Wait, no. Terminal characters are roughly 2:1 height:width.
+    So 1 character wide, 1 character high (2 half-blocks) is roughly square.
+    Thus, width_px = height_px results in a square image.
+    """
     try:
         if not os.path.exists(path):
-            return None, 0, 0
+            return None, 0, 0, (214, 214, 214)
 
         im = Image.open(path).convert("RGB")
-        # For High-Def Half-Blocks, we want a 1:1 pixel aspect ratio 
-        # before the terminal stretches it.
-        new_width = size
-        new_height = size
         
-        im = im.resize((new_width, new_height), Image.Resampling.LANCZOS)
+        # Target dimensions for the half-block renderer
+        # max_w is characters, max_h is characters.
+        # Each character is 1px wide and 2px high in the pixel matrix.
+        target_w = max_w
+        target_h = max_h * 2
+        
+        # Maintain aspect ratio
+        im.thumbnail((target_w, target_h), Image.Resampling.LANCZOS)
+        
         dom_color = get_dominant_color(path)
-        return list(im.getdata()), new_width, im.height, dom_color
+        return list(im.getdata()), im.width, im.height, dom_color
     except Exception:
-        return None, 0, 0
+        return None, 0, 0, (214, 214, 214)

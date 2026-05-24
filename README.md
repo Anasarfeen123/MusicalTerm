@@ -14,7 +14,7 @@ It combines the power of **yt-dlp** and **mpv** with a beautiful **curses-based 
 
 ### 🎧 YouTube Streaming
 
-Play single videos or entire playlists from **YouTube** and **YouTube Music**.
+Play single videos, entire playlists, or plain text searches from **YouTube** and **YouTube Music**.
 
 ### 🖼 HD Album Art in Terminal
 
@@ -34,6 +34,18 @@ Toggle seamlessly between:
 
 * **Now Playing Dashboard**
 * **Queue Browser**
+
+### 🔎 Built-in Search
+
+Paste a URL or type a search query at startup. Search results load directly into the queue.
+
+### ⭐ Favorites and Queue Filters
+
+Mark tracks as favorites, filter the queue by title/channel, and switch between all tracks and favorites.
+
+### 🎭 Theme Cycling
+
+Switch between multiple terminal palettes while the player is running.
 
 ### 🎛 Precision Controls
 
@@ -102,7 +114,7 @@ Launch the player with:
 python main.py
 ```
 
-1. Paste a **YouTube or YouTube Music URL**
+1. Paste a **YouTube / YouTube Music URL** or type a search query
 2. MusicalTerm will load the tracks
 3. Use keyboard shortcuts to control playback
 
@@ -113,13 +125,18 @@ python main.py
 | Key       | Action                        |
 | --------- | ----------------------------- |
 | **TAB**   | Toggle Player / Queue views   |
-| **P**     | Pause playback                |
+| **Space/P** | Play / pause playback       |
 | **R**     | Resume playback               |
 | **N**     | Next track                    |
 | **B**     | Previous track                |
 | **S**     | Toggle shuffle                |
 | **L**     | Toggle loop                   |
 | **M**     | Mute / Unmute                 |
+| **F**     | Favorite / unfavorite track   |
+| **A**     | Show all / favorites in queue |
+| **/**     | Filter queue                  |
+| **T**     | Cycle theme                   |
+| **?**     | Show help overlay             |
 | **↑ / ↓** | Volume up / down              |
 | **← / →** | Seek backward / forward (10s) |
 | **Q**     | Quit MusicalTerm              |

@@ -7,6 +7,9 @@ import curses
 import threading
 import random
 import time
+import os
+import tempfile
+import math
 from pyfiglet import Figlet
 import core
 import player
@@ -61,9 +64,37 @@ C_ART_BG  = 8   # Art panel border (set per-album by dominant color)
 C_CYAN    = 9   # Secondary accent — rose/salmon
 C_MAGENTA = 10  # Tertiary accent — soft lavender
 
+# ─── Art Helpers ─────────────────────────────────────────────────────────────
+
+def to256(r, g, b):
+    """Accurate RGB to 256-color terminal index mapping."""
+    # Grayscale ramp
+    if abs(r - g) < 4 and abs(g - b) < 4:
+        if r < 8: return 16
+        if r > 248: return 231
+        return 232 + (r - 8) // 10
+    
+    # 6x6x6 Color Cube
+    def q(x):
+        if x < 48: return 0
+        if x < 115: return 1
+        if x < 155: return 2
+        if x < 195: return 3
+        if x < 235: return 4
+        return 5
+    
+    return 16 + q(r)*36 + q(g)*6 + q(b)
+
 # ─── Art State ────────────────────────────────────────────────────────────────
 art_lock = threading.Lock()
-art_data = {"pixels": None, "w": 0, "h": 0, "loading": False, "dom_idx": 51}
+art_data = {
+    "pixels": None, 
+    "w": 0, "h": 0, 
+    "loading": False, 
+    "dom_idx": 51,
+    "pairs": {},    # (fg, bg) -> pair_idx
+    "nxt_pair": 200 # Start safe from theme colors
+}
 
 
 # ─── State ────────────────────────────────────────────────────────────────────
@@ -73,6 +104,7 @@ class State:
         self.shuffle_pool   = []  # remaining unplayed indices for true shuffle
         self.history        = []
         self.current_idx    = 0
+        self.queue_cursor   = 0
         self.volume         = 70
         self.paused         = False
         self.repeat         = False
@@ -80,6 +112,14 @@ class State:
         self.muted          = False
         self.view           = "player"
         self.queue_offset   = 0
+        self.filter_text    = ""
+        self.filter_mode    = False
+        self.favorites      = set()
+        self.favorites_only = False
+        self.help_open      = False
+        self.theme_idx      = 0
+        self.media_title    = ""
+        self.media_type     = ""
         self._status_msg    = ""
         self._status_ts     = 0
         self.spin_idx       = 0
@@ -108,61 +148,90 @@ class State:
             return self.current_idx
         return (self.current_idx + 1) % len(self.queue)
 
+    def visible_indices(self):
+        items = []
+        needle = self.filter_text.lower().strip()
+        for idx, track in enumerate(self.queue):
+            if self.favorites_only and idx not in self.favorites:
+                continue
+            title = (track.get("title") or "").lower()
+            artist = (track.get("uploader") or "").lower()
+            if needle and needle not in title and needle not in artist:
+                continue
+            items.append(idx)
+        return items
+
+    def sync_cursor_to_current(self):
+        self.queue_cursor = self.current_idx
+
 
 # ─── Art Loading ──────────────────────────────────────────────────────────────
 
-def _bg_load_art(url, art_width):
+def _bg_load_art(url, art_w, art_h):
     global art_data
     with art_lock:
         art_data["loading"] = True
 
-    if core.download_thumbnail(url, "cover.jpg"):
-        px, w, h, dom_rgb = core.get_album_art_matrix("cover.jpg", size=art_width - 4)
-        dom_idx = 16 + int(dom_rgb[0]/255*5)*36 + int(dom_rgb[1]/255*5)*6 + int(dom_rgb[2]/255*5)
+    cover_path = os.path.join(tempfile.gettempdir(), f"musicalterm_cover_{os.getpid()}.jpg")
+    if core.download_thumbnail(url, cover_path):
+        px, w, h, dom_rgb = core.get_album_art_matrix(cover_path, max_w=art_w-4, max_h=art_h-4)
+        if px:
+            indices = [to256(r, g, b) for r, g, b in px]
+            dom_idx = to256(*dom_rgb)
 
-        with art_lock:
-            art_data.update(pixels=px, w=w, h=h, dom_idx=dom_idx)
-            curses.init_pair(C_ART_BG, dom_idx, -1)
-            curses.init_pair(C_QUEUE_H, dom_idx, -1)
+            with art_lock:
+                art_data.update(pixels=indices, w=w, h=h, dom_idx=dom_idx)
+                art_data["pairs"] = {}
+                art_data["nxt_pair"] = 200
 
     with art_lock:
         art_data["loading"] = False
 
 
-def trigger_art_load(url, art_width):
-    threading.Thread(target=_bg_load_art, args=(url, art_width), daemon=True).start()
+def trigger_art_load(url, art_w, art_h):
+    threading.Thread(target=_bg_load_art, args=(url, art_w, art_h), daemon=True).start()
 
 
-def draw_art(win, pixels, img_w, img_h):
-    """Renders album art using the Half-Block technique for HD color."""
-    if not pixels:
+def draw_art(win, indices, img_w, img_h):
+    """Renders album art using the Half-Block technique with persistent caching."""
+    if not indices:
         return
 
-    def to256(r, g, b):
-        return 16 + int(r/255*5)*36 + int(g/255*5)*6 + int(b/255*5)
+    win_h, win_w = win.getmaxyx()
+    start_y = max(1, (win_h - (img_h // 2)) // 2)
+    start_x = max(1, (win_w - img_w) // 2)
 
-    cache, nxt = {}, 15
+    with art_lock:
+        cache = art_data["pairs"]
+        nxt   = art_data["nxt_pair"]
+
     for y in range(0, img_h - 1, 2):
         for x in range(img_w):
             idx_top = y * img_w + x
             idx_bot = (y + 1) * img_w + x
-            if idx_top >= len(pixels) or idx_bot >= len(pixels):
+            if idx_top >= len(indices) or idx_bot >= len(indices):
                 continue
-            r1, g1, b1 = pixels[idx_top]
-            r2, g2, b2 = pixels[idx_bot]
-            fg, bg = to256(r1, g1, b1), to256(r2, g2, b2)
+            
+            fg, bg = indices[idx_top], indices[idx_bot]
             key = (fg, bg)
             if key not in cache:
-                if nxt < curses.COLOR_PAIRS:
-                    curses.init_pair(nxt, fg, bg)
-                    cache[key] = nxt
-                    nxt += 1
+                if nxt < 3000: # Safe limit for most terminals
+                    try:
+                        curses.init_pair(nxt, fg, bg)
+                        cache[key] = nxt
+                        nxt += 1
+                    except:
+                        cache[key] = 0
                 else:
                     cache[key] = 0
+            
             try:
-                win.addch((y // 2) + 1, x + 1, "▀", curses.color_pair(cache[key]))
-            except curses.error:
+                win.addch(start_y + (y // 2), start_x + x, "▀", curses.color_pair(cache.get(key, 0)))
+            except:
                 pass
+    
+    with art_lock:
+        art_data["nxt_pair"] = nxt
 
 
 # ─── Primitives ───────────────────────────────────────────────────────────────
@@ -205,6 +274,111 @@ def fmt_t(s):
     return f"{m:02}:{sec:02}"
 
 
+def track_duration(track):
+    return track.get("duration")
+
+
+def total_duration(queue):
+    vals = [t.get("duration") for t in queue if t.get("duration")]
+    return sum(vals) if vals else None
+
+
+THEMES = [
+    {
+        "name": "ember",
+        "accent": 214,
+        "dim": 238,
+        "white": 255,
+        "green": 150,
+        "title": 214,
+        "status": 203,
+        "queue": 214,
+        "art": 94,
+        "cyan": 216,
+        "magenta": 183,
+    },
+    {
+        "name": "neon",
+        "accent": 81,
+        "dim": 244,
+        "white": 255,
+        "green": 118,
+        "title": 45,
+        "status": 203,
+        "queue": 81,
+        "art": 33,
+        "cyan": 159,
+        "magenta": 213,
+    },
+    {
+        "name": "mono",
+        "accent": 250,
+        "dim": 240,
+        "white": 255,
+        "green": 248,
+        "title": 255,
+        "status": 209,
+        "queue": 250,
+        "art": 245,
+        "cyan": 252,
+        "magenta": 247,
+    },
+]
+
+
+def apply_theme(st):
+    theme = THEMES[st.theme_idx % len(THEMES)]
+    curses.init_pair(C_ACCENT,  theme["accent"],  -1)
+    curses.init_pair(C_DIM,     theme["dim"],     -1)
+    curses.init_pair(C_WHITE,   theme["white"],   -1)
+    curses.init_pair(C_GREEN,   theme["green"],   -1)
+    curses.init_pair(C_TITLE,   theme["title"],   -1)
+    curses.init_pair(C_STATUS,  theme["status"],  -1)
+    curses.init_pair(C_QUEUE_H, theme["queue"],   -1)
+    curses.init_pair(C_ART_BG,  theme["art"],     -1)
+    curses.init_pair(C_CYAN,    theme["cyan"],    -1)
+    curses.init_pair(C_MAGENTA, theme["magenta"], -1)
+
+
+def render_help_overlay(stdscr, st):
+    h, w = stdscr.getmaxyx()
+    box_w = min(74, w - 4)
+    box_h = min(18, h - 4)
+    y = max(1, (h - box_h) // 2)
+    x = max(1, (w - box_w) // 2)
+    win = curses.newwin(box_h, box_w, y, x)
+    accent = curses.color_pair(C_ACCENT)
+    dim = curses.color_pair(C_DIM)
+    white = curses.color_pair(C_WHITE)
+    stat = curses.color_pair(C_STATUS)
+
+    win.erase()
+    draw_box(win, box_h, box_w, accent)
+    panel_label(win, "K E Y S", box_w, accent)
+
+    rows = [
+        ("Space", "play / pause"),
+        ("N / B", "next / previous"),
+        ("S / L / M", "shuffle / repeat / mute"),
+        ("Up Down", "volume or queue movement"),
+        ("Left Right", "seek -10s / +10s"),
+        ("Tab", "player / queue"),
+        ("/", "filter queue"),
+        ("F", "favorite current or highlighted track"),
+        ("A", "show all / favorites only"),
+        ("T", f"theme: {THEMES[st.theme_idx % len(THEMES)]['name']}"),
+        ("?", "close help"),
+        ("Q", "quit"),
+    ]
+    col_w = max(20, (box_w - 6) // 2)
+    for i, (key, label) in enumerate(rows[:box_h-4]):
+        row = 2 + i
+        S(win, row, 3, trunc(key, col_w - 2), white | curses.A_BOLD)
+        S(win, row, col_w, trunc(label, box_w - col_w - 3), dim)
+
+    S(win, box_h - 2, 3, "Tip: paste a URL or type a search query at launch.", stat | curses.A_DIM)
+    win.refresh()
+
 
 # ─── URL Input Screen ─────────────────────────────────────────────────────────
 
@@ -230,16 +404,16 @@ def get_url_input(stdscr):
 
     cy = len(banner) + 2
 
-    title_line = "  ♪  Enter a YouTube / YouTube Music URL  ♪  "
+    title_line = "  ♪  Paste a YouTube URL or type a search  ♪  "
     S(stdscr, cy, max(0, (width - len(title_line))//2), title_line, white | curses.A_BOLD)
     cy += 2
 
     hint_lines = [
-        "Supported formats:",
+        "Supported input:",
         "  • Single video   → https://www.youtube.com/watch?v=...",
         "  • Playlist       → https://www.youtube.com/playlist?list=...",
         "  • YT Music song  → https://music.youtube.com/watch?v=...",
-        "  • YT Music list  → https://music.youtube.com/playlist?list=...",
+        "  • Search query   → boards of canada roygbiv",
         "",
         "Press ENTER to confirm  ·  ESC or Ctrl+C to quit",
     ]
@@ -250,7 +424,7 @@ def get_url_input(stdscr):
     cy += 1
     box_w  = min(72, width - 6)
     box_x  = max(0, (width - box_w)//2)
-    prompt = " URL › "
+    prompt = " Play › "
 
     # Input box border
     S(stdscr, cy,   box_x, CHARS["tl"] + CHARS["h_line"]*(box_w-2) + CHARS["tr"], gold)
@@ -285,7 +459,7 @@ def get_url_input(stdscr):
                 if url:
                     curses.curs_set(0)
                     return url
-                S(stdscr, err_y, box_x, " Please enter a URL before pressing Enter. ", stat)
+                S(stdscr, err_y, box_x, " Please enter a URL or search before pressing Enter. ", stat)
                 stdscr.refresh()
             elif ch == "\x1b":     # ESC
                 curses.curs_set(0)
@@ -316,6 +490,13 @@ def render_art_panel(win, st, art_w, art_h):
     with art_lock:
         dom_idx = art_data.get("dom_idx", 214)
 
+    # Re-init dominant color in main thread for safety
+    try:
+        curses.init_pair(C_ART_BG, dom_idx, -1)
+        curses.init_pair(C_QUEUE_H, dom_idx, -1)
+    except:
+        pass
+
     border_color = curses.color_pair(C_ART_BG)
     dim          = curses.color_pair(C_DIM)
 
@@ -333,16 +514,25 @@ def render_art_panel(win, st, art_w, art_h):
     elif pixels:
         draw_art(win, pixels, iw, ih)
     else:
-        center_y = art_h // 2
-        center_x = art_w // 2
-        radius   = min(art_h, art_w) // 3
-        for y in range(1, art_h-1):
-            for x in range(1, art_w-1):
-                dy = y - center_y
-                dx = x - center_x
-                if dx*dx + dy*dy < radius*radius:
-                    S(win, y, x, "•", dim)
-        S(win, center_y, center_x-3, "VINYL", border_color | curses.A_BOLD)
+        # ─── Improved Vinyl Aesthetic ───
+        cy, cx = art_h // 2, art_w // 2
+        r = min(art_h, art_w) // 3
+        
+        # Draw grooves
+        for i in range(r, r-4, -1):
+            if i <= 0: continue
+            for angle in range(0, 360, 10):
+                rad = math.radians(angle)
+                y = int(cy + (i * 0.5) * math.sin(rad))
+                x = int(cx + (i * 1.1) * math.cos(rad))
+                if 0 < y < art_h-1 and 0 < x < art_w-1:
+                    win.addch(y, x, "·", dim)
+
+        # Record Label
+        S(win, cy, cx-3, "  ●  ", border_color | curses.A_BOLD)
+        S(win, cy-1, cx-3, " .-. ", dim)
+        S(win, cy+1, cx-3, " '-' ", dim)
+        S(win, cy, cx-1, "VINYL", border_color | curses.A_BOLD | curses.A_REVERSE)
     win.refresh()
 
 
@@ -362,8 +552,10 @@ def render_player_panel(win, st, p_w, p_h):
 
     track   = st.queue[st.current_idx] if st.queue else None
     title   = track["title"] if track else "No track loaded"
+    artist  = track.get("uploader") if track else None
     counter = f"{st.current_idx+1:02}/{len(st.queue):02}"
-    display_title = f"❖ {trunc(title, iw - len(counter) - 6)}"
+    fav = "♥ " if st.current_idx in st.favorites else ""
+    display_title = f"{fav}❖ {trunc(title, iw - len(counter) - len(fav) - 6)}"
     S(win, 2, 2, display_title, accent | curses.A_BOLD)
     S(win, 2, p_w - len(counter) - 2, counter, dim)
 
@@ -406,15 +598,41 @@ def render_player_panel(win, st, p_w, p_h):
 
     draw_hrule(win, 5, 0, p_w, accent)
 
+    meta_y = 6
+    if artist:
+        S(win, meta_y, 2, trunc(f"by {artist}", iw), dim)
+    else:
+        S(win, meta_y, 2, trunc(st.media_title or "streaming from YouTube", iw), dim)
+
+    known_total = total_duration(st.queue)
+    cur_dur = track_duration(track) if track else None
+    stats = []
+    if st.media_type:
+        stats.append(st.media_type.upper())
+    if cur_dur:
+        stats.append(f"track {fmt_t(cur_dur)}")
+    if known_total:
+        stats.append(f"set {fmt_t(known_total)}")
+    if st.favorites:
+        stats.append(f"{len(st.favorites)} favorites")
+    if stats:
+        S(win, meta_y + 1, 2, trunc("  ·  ".join(stats), iw), cyan | curses.A_DIM)
+
     # Volume bar — green→cyan gradient feel
     vbw   = iw - 10
     vfill = round((st.volume / 100) * vbw)
     vbar  = CHARS["vol_fill"]*vfill + CHARS["vol_empty"]*(vbw-vfill)
     vlabel = f"{CHARS['vol']} {st.volume:3d}%"
-    S(win, 6, 2, vlabel, accent | curses.A_BOLD)
-    half = vbw // 2
-    S(win, 6, 2 + len(vlabel) + 1, vbar[:half], grn)
-    S(win, 6, 2 + len(vlabel) + 1 + half, vbar[half:], cyan)
+    S(win, 9, 2, vlabel, accent | curses.A_BOLD)
+    half = max(0, vbw // 2)
+    S(win, 9, 2 + len(vlabel) + 1, vbar[:half], grn)
+    S(win, 9, 2 + len(vlabel) + 1 + half, vbar[half:], cyan)
+
+    next_idx = st.next_idx() if st.queue else None
+    if next_idx is not None and next_idx != st.current_idx:
+        next_title = st.queue[next_idx].get("title") or "Unknown"
+        S(win, 11, 2, "UP NEXT", dim | curses.A_BOLD)
+        S(win, 12, 2, trunc(f"{CHARS['arrow']} {next_title}", iw), white)
 
     draw_hrule(win, p_h - 5, 0, p_w, accent)
 
@@ -458,37 +676,70 @@ def render_queue_panel(win, st, p_w, p_h):
 
     draw_box(win, p_h, p_w, accent)
 
+    visible_indices = st.visible_indices()
+    count_label = f"{len(visible_indices)}/{len(st.queue)}" if len(visible_indices) != len(st.queue) else str(len(st.queue))
+    mode_bits = []
     if st.shuffle:
-        panel_label(win, f"Q U E U E  ({len(st.queue)})  {CHARS['shuffle_on']} SHUFFLE", p_w, cyan)
-    else:
-        panel_label(win, f"Q U E U E  ({len(st.queue)})", p_w, accent)
+        mode_bits.append(f"{CHARS['shuffle_on']} SHUFFLE")
+    if st.favorites_only:
+        mode_bits.append("♥ FAVS")
+    suffix = "  " + "  ".join(mode_bits) if mode_bits else ""
 
-    visible = p_h - 4
-    if st.current_idx < st.queue_offset:
-        st.queue_offset = st.current_idx
-    elif st.current_idx >= st.queue_offset + visible:
-        st.queue_offset = st.current_idx - visible + 1
+    if st.shuffle or st.favorites_only:
+        panel_label(win, f"Q U E U E  ({count_label}){suffix}", p_w, cyan)
+    else:
+        panel_label(win, f"Q U E U E  ({count_label})", p_w, accent)
+
+    filter_line = ""
+    if st.filter_mode:
+        filter_line = f"/ {st.filter_text}"
+    elif st.filter_text:
+        filter_line = f"filter: {st.filter_text}"
+    if filter_line:
+        S(win, 1, 2, trunc(filter_line, p_w - 4), cyan | curses.A_BOLD)
+
+    visible = p_h - 5
+    if st.queue_cursor not in visible_indices and visible_indices:
+        st.queue_cursor = visible_indices[0]
+    cursor_pos = visible_indices.index(st.queue_cursor) if st.queue_cursor in visible_indices else 0
+    if cursor_pos < st.queue_offset:
+        st.queue_offset = cursor_pos
+    elif cursor_pos >= st.queue_offset + visible:
+        st.queue_offset = cursor_pos - visible + 1
+    st.queue_offset = max(0, min(st.queue_offset, max(0, len(visible_indices) - visible)))
 
     for i in range(visible):
-        idx = st.queue_offset + i
-        if idx >= len(st.queue):
+        pos = st.queue_offset + i
+        if pos >= len(visible_indices):
             break
-        label  = trunc(st.queue[idx].get("title") or "Unknown", p_w - 8)
+        idx = visible_indices[pos]
+        fav = "♥" if idx in st.favorites else " "
+        dur = fmt_t(st.queue[idx].get("duration")) if st.queue[idx].get("duration") else "     "
+        label  = trunc(st.queue[idx].get("title") or "Unknown", p_w - 18)
         is_cur = idx == st.current_idx
+        is_cursor = idx == st.queue_cursor
+        prefix = f"{idx+1:3}. {fav} "
+        suffix = f" {dur}"
 
         if is_cur:
-            S(win, i+2, 1, f" {CHARS['bullet']} {label}", hl | curses.A_BOLD | curses.A_REVERSE)
+            S(win, i+3, 1, trunc(f" {CHARS['bullet']} {fav} {label}{suffix}", p_w - 2),
+              hl | curses.A_BOLD | curses.A_REVERSE)
+        elif is_cursor:
+            S(win, i+3, 1, trunc(f"{prefix}{label}{suffix}", p_w - 2),
+              accent | curses.A_BOLD)
         elif st.shuffle and idx not in st.shuffle_pool and idx != st.current_idx:
             # Already played this shuffle cycle
-            S(win, i+2, 1, f"{idx+1:3}. {label}", dim | curses.A_DIM)
+            S(win, i+3, 1, trunc(f"{prefix}{label}{suffix}", p_w - 2), dim | curses.A_DIM)
         else:
-            S(win, i+2, 1, f"{idx+1:3}. {label}", dim)
+            S(win, i+3, 1, trunc(f"{prefix}{label}{suffix}", p_w - 2), dim)
 
-    total = len(st.queue)
+    total = len(visible_indices)
     if total > visible:
-        end  = min(st.queue_offset + visible, total)
-        note = f" {st.queue_offset+1}–{end}/{total} "
+        end = min(st.queue_offset + visible, total)
+        note = f" {st.queue_offset+1}-{end}/{total} "
         S(win, p_h-2, p_w-len(note)-1, note, dim | curses.A_DIM)
+    elif not visible_indices:
+        S(win, p_h//2, max(2, (p_w - 18)//2), "No matching tracks", dim | curses.A_DIM)
 
     win.refresh()
 
@@ -504,11 +755,20 @@ def render_footer(win, width, st):
         pass
 
     if st.view == "player":
-        keys = [("Q","quit"),("P","pause"),("R","resume"),("N","next"),
-                ("B","back"),("S","shuffle"),("L","loop"),("M","mute"),
-                ("↑↓","vol"),("←→","seek"),("TAB","queue")]
+        keys = [("Q","quit"),("Space","play"),("N","next"),("B","back"),
+                ("S","shuffle"),("F","fav"),("T","theme"),
+                ("↑↓","vol"),("←→","seek"),("TAB","queue"),("?","help")]
+        compact_keys = [("Q","quit"),("Space","play"),("N","next"),
+                        ("↑↓","vol"),("TAB","queue"),("?","help")]
     else:
-        keys = [("TAB","player"),("↑↓","scroll"),("↵","play"),("Q","quit")]
+        keys = [("TAB","player"),("↑↓","move"),("↵","play"),("/","filter"),
+                ("F","fav"),("A","favs"),("Q","quit"),("?","help")]
+        compact_keys = [("TAB","player"),("↑↓","move"),("↵","play"),
+                        ("/","filter"),("Q","quit"),("?","help")]
+
+    need = sum(len(k)+len(v)+4 for k,v in keys) + len(keys)
+    if need > width - 2:
+        keys = compact_keys
 
     cx = max(0, (width - sum(len(k)+len(v)+4 for k,v in keys) - len(keys)) // 2)
     for i, (k, v) in enumerate(keys):
@@ -540,17 +800,8 @@ def run_ui(stdscr):
     stdscr.nodelay(True)
     stdscr.keypad(True)
 
-    # Static theme: warm amber / rose / lavender on deep dark
-    curses.init_pair(C_ACCENT,  214,  -1)   # Warm amber/gold
-    curses.init_pair(C_DIM,    238,  -1)   # Dark slate grey
-    curses.init_pair(C_WHITE,  255,  -1)   # Bright white
-    curses.init_pair(C_GREEN,  150,  -1)   # Soft sage green
-    curses.init_pair(C_TITLE,  214,  -1)   # Amber title
-    curses.init_pair(C_STATUS, 203,  -1)   # Warm coral for warnings
-    curses.init_pair(C_QUEUE_H,214,  -1)   # Matches accent
-    curses.init_pair(C_ART_BG,  94,  -1)   # Deep burnt orange for art border
-    curses.init_pair(C_CYAN,   216,  -1)   # Peach/rose secondary
-    curses.init_pair(C_MAGENTA,183,  -1)   # Soft lavender tertiary
+    st = State()
+    apply_theme(st)
 
     height, width = stdscr.getmaxyx()
     if height < 24 or width < 82:
@@ -569,10 +820,14 @@ def run_ui(stdscr):
     stdscr.clear()
     stdscr.refresh()
 
-    banner   = f_title.renderText("MusicalTerm").splitlines()
+    if height < 30:
+        banner = f_title.renderText("MT").splitlines()
+    else:
+        banner = f_title.renderText("MusicalTerm").splitlines()
     banner_h = len(banner) + 1
-    art_w, art_h = 40, 20
-    p_w  = min(width - art_w - 6, 58)
+    art_h = max(12, min(20, height - banner_h - 5))
+    art_w = max(24, min(40, art_h * 2))
+    p_w  = max(44, min(width - art_w - 6, 62))
     p_h  = art_h
     sx   = max(0, (width - art_w - p_w - 2) // 2)
     cy   = banner_h + 1
@@ -582,7 +837,6 @@ def run_ui(stdscr):
     main_win   = curses.newwin(p_h,      p_w,     cy,       sx + art_w + 2)
     footer_win = curses.newwin(3,        width,   height-3, 0)
 
-    st = State()
     render_header(header_win, banner, width, st)
 
     S(stdscr, cy + art_h//2, sx + 2, "  ◐  fetching playlist…  ",
@@ -598,19 +852,23 @@ def run_ui(stdscr):
         return
 
     st.queue = media["tracks"]
+    st.media_title = media.get("title") or ""
+    st.media_type = media.get("type") or ""
     st.reset_shuffle_pool()
 
     def start_track(idx, push=True):
+        idx = max(0, min(idx, len(st.queue) - 1))
         if push and st.current_idx != idx:
             st.history.append(st.current_idx)
         st.current_idx = idx
+        st.queue_cursor = idx
         if idx in st.shuffle_pool:
             st.shuffle_pool.remove(idx)
         track = st.queue[idx]
         player.play_stream(track["url"])
         player.set_volume(st.volume)
         st.paused = False
-        trigger_art_load(track["url"], art_w)
+        trigger_art_load(track["url"], art_w, art_h)
         st.set_status(f"{CHARS['play']}  {trunc(track['title'] or '…', 40)}")
 
     start_track(0, push=False)
@@ -618,38 +876,102 @@ def run_ui(stdscr):
 
     while True:
         key = stdscr.getch()
+        char = chr(key).lower() if 0 <= key < 256 else ""
 
-        if key == ord("q"):
+        if st.help_open:
+            if char in ("?", "q") or key == 27:
+                st.help_open = False
+            render_header(header_win, banner, width, st)
+            render_art_panel(art_win, st, art_w, art_h)
+            (render_player_panel if st.view == "player" else render_queue_panel)(
+                main_win, st, p_w, p_h)
+            render_footer(footer_win, width, st)
+            render_help_overlay(stdscr, st)
+            st.spin_idx += 1
+            curses.napms(100)
+            continue
+
+        if char == "?":
+            st.help_open = True
+
+        elif char == "q":
             player.stop_stream()
             break
 
         elif key == ord("\t"):
             st.view = "queue" if st.view == "player" else "player"
+            if st.view == "queue":
+                st.sync_cursor_to_current()
 
         elif st.view == "queue":
-            if   key == curses.KEY_UP:   st.queue_offset = max(0, st.queue_offset-1)
-            elif key == curses.KEY_DOWN: st.queue_offset = min(len(st.queue)-1, st.queue_offset+1)
+            if st.filter_mode:
+                if key in (27,):
+                    st.filter_mode = False
+                elif key in (curses.KEY_BACKSPACE, 127, 8):
+                    st.filter_text = st.filter_text[:-1]
+                elif key in [ord("\n"), curses.KEY_ENTER]:
+                    st.filter_mode = False
+                elif char and ord(char) >= 32:
+                    st.filter_text += chr(key)
+                visible = st.visible_indices()
+                if visible:
+                    st.queue_cursor = visible[0]
+                    st.queue_offset = 0
+            elif key == curses.KEY_UP:
+                visible = st.visible_indices()
+                if visible:
+                    pos = visible.index(st.queue_cursor) if st.queue_cursor in visible else 0
+                    st.queue_cursor = visible[max(0, pos - 1)]
+            elif key == curses.KEY_DOWN:
+                visible = st.visible_indices()
+                if visible:
+                    pos = visible.index(st.queue_cursor) if st.queue_cursor in visible else 0
+                    st.queue_cursor = visible[min(len(visible) - 1, pos + 1)]
+            elif char == "/":
+                st.filter_mode = True
+                st.filter_text = ""
+            elif char == "a":
+                st.favorites_only = not st.favorites_only
+                st.queue_offset = 0
+                visible = st.visible_indices()
+                if visible:
+                    st.queue_cursor = visible[0]
+                st.set_status("showing favorites" if st.favorites_only else "showing all tracks")
+            elif char == "f":
+                target = st.queue_cursor
+                if target in st.favorites:
+                    st.favorites.remove(target)
+                    st.set_status("removed favorite")
+                else:
+                    st.favorites.add(target)
+                    st.set_status("added favorite")
             elif key in [ord("\n"), curses.KEY_ENTER]:
-                start_track(st.queue_offset)
-                st.view = "player"
+                if st.visible_indices():
+                    start_track(st.queue_cursor)
+                    st.view = "player"
 
         else:
-            if key == ord("n"):
+            if char == "n":
                 start_track(st.next_idx())
-            elif key == ord("b"):
+            elif char == "b":
                 if st.history:
                     start_track(st.history.pop(), push=False)
                 elif st.current_idx > 0:
                     start_track(st.current_idx - 1)
-            elif key == ord("p"):
-                player.pause_stream()
-                st.paused = True
-                st.set_status(f"{CHARS['pause']}  paused")
-            elif key == ord("r"):
+            elif char in ("p", " "):
+                if st.paused:
+                    player.resume_stream()
+                    st.paused = False
+                    st.set_status(f"{CHARS['play']}  resumed")
+                else:
+                    player.pause_stream()
+                    st.paused = True
+                    st.set_status(f"{CHARS['pause']}  paused")
+            elif char == "r":
                 player.resume_stream()
                 st.paused = False
                 st.set_status(f"{CHARS['play']}  resumed")
-            elif key == ord("s"):
+            elif char == "s":
                 st.shuffle = not st.shuffle
                 if st.shuffle:
                     st.reset_shuffle_pool()
@@ -657,13 +979,24 @@ def run_ui(stdscr):
                 else:
                     st.shuffle_pool = []
                     st.set_status(f"{CHARS['shuffle_off']}  shuffle off")
-            elif key == ord("l"):
+            elif char == "l":
                 st.repeat = not st.repeat
                 st.set_status(f"{CHARS['repeat_on']}  repeat {'on' if st.repeat else 'off'}")
-            elif key == ord("m"):
+            elif char == "m":
                 st.muted = not st.muted
                 player.toggle_mute()
                 st.set_status(f"{CHARS['mute']}  {'muted' if st.muted else 'unmuted'}")
+            elif char == "f":
+                if st.current_idx in st.favorites:
+                    st.favorites.remove(st.current_idx)
+                    st.set_status("removed favorite")
+                else:
+                    st.favorites.add(st.current_idx)
+                    st.set_status("added favorite")
+            elif char == "t":
+                st.theme_idx = (st.theme_idx + 1) % len(THEMES)
+                apply_theme(st)
+                st.set_status(f"theme: {THEMES[st.theme_idx]['name']}")
             elif key == curses.KEY_UP:
                 st.volume = min(100, st.volume+5)
                 player.set_volume(st.volume)
@@ -701,6 +1034,8 @@ def run_ui(stdscr):
         (render_player_panel if st.view == "player" else render_queue_panel)(
             main_win, st, p_w, p_h)
         render_footer(footer_win, width, st)
+        if st.help_open:
+            render_help_overlay(stdscr, st)
 
         st.spin_idx += 1
         curses.napms(100)
