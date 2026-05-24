@@ -1,6 +1,8 @@
 import os
 import contextlib
 from typing import Any, Dict, cast
+from urllib.parse import urlencode
+import re
 import yt_dlp
 import requests
 from PIL import Image
@@ -199,10 +201,10 @@ def download_thumbnail(url, save_path="cover.jpg"):
 
 # ─── Lyrics Extraction ────────────────────────────────────────────────────────
 
-def fetch_lyrics(url):
+def fetch_lyrics(url, title=None, artist=None, duration=None):
     """
     Fetches synced lyrics (subtitles) if available.
-    Returns a list of (timestamp, text) or None.
+    Returns raw subtitle text if available.
     """
     if is_local_path(url):
         # Look for .lrc file
@@ -212,41 +214,172 @@ def fetch_lyrics(url):
             if os.path.exists(p):
                 # Simple parser for now
                 try:
-                    with open(p, "r") as f:
+                    with open(p, "r", encoding="utf-8", errors="replace") as f:
                         return f.read() # Return raw for now, parse in UI
                 except:
                     pass
         return None
 
+    lrc_lyrics = _fetch_lrclib_lyrics(title, artist, duration)
+    if lrc_lyrics:
+        return lrc_lyrics
+
     url = normalize_youtube_url(url)
     opts = {
         **_BASE_OPTS,
         "skip_download": True,
-        "writesubtitles": True,
-        "writeautomaticsub": True,
-        "subtitleslangs": ["en.*", ".*"],
+        "writesubtitles": False,
+        "writeautomaticsub": False,
+        "subtitlesformat": "vtt/srt/json3/best",
     }
 
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
-            
-        subs = info.get("requested_subtitles")
-        if not subs:
-            # Try manual subtitles
-            subs = info.get("subtitles")
-        
-        if subs:
-            # Pick first available subtitle
-            lang = list(subs.keys())[0]
-            sub_url = subs[lang].get("url")
-            if sub_url:
-                resp = requests.get(sub_url, timeout=10)
-                if resp.status_code == 200:
-                    return resp.text
+
+        sub_url = _pick_subtitle_url(
+            info.get("subtitles") or {},
+            info.get("automatic_captions") or {},
+            info.get("requested_subtitles") or {},
+        )
+        if sub_url:
+            resp = requests.get(sub_url, timeout=10)
+            if resp.status_code == 200:
+                return resp.text
     except Exception:
         pass
     return None
+
+
+def _fetch_lrclib_lyrics(title=None, artist=None, duration=None):
+    title, artist = _clean_lyrics_query(title, artist)
+    if not title:
+        return None
+
+    params = {"track_name": title}
+    if artist:
+        params["artist_name"] = artist
+    if duration:
+        params["duration"] = int(duration)
+
+    try:
+        resp = requests.get(
+            f"https://lrclib.net/api/search?{urlencode(params)}",
+            headers={"User-Agent": "MusicalTerm/1.0"},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return None
+        results = resp.json()
+    except Exception:
+        return None
+
+    if not isinstance(results, list):
+        return None
+
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        synced = item.get("syncedLyrics")
+        if synced:
+            return synced
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        plain = item.get("plainLyrics")
+        if plain:
+            return plain
+    return None
+
+
+def _clean_lyrics_query(title=None, artist=None):
+    title = (title or "").strip()
+    artist = (artist or "").strip()
+
+    for sep in (" - ", " – ", " — "):
+        if sep in title and not artist:
+            maybe_artist, maybe_title = title.split(sep, 1)
+            artist = maybe_artist.strip()
+            title = maybe_title.strip()
+            break
+
+    noise = [
+        "official music video",
+        "official video",
+        "official audio",
+        "lyrics video",
+        "lyric video",
+        "audio",
+        "video",
+        "lyrics",
+        "hd",
+        "hq",
+    ]
+    for marker in noise:
+        title = title.replace(f"({marker})", "")
+        title = title.replace(f"[{marker}]", "")
+        title = title.replace(marker.title(), "")
+        title = title.replace(marker.upper(), "")
+
+    title = re.sub(r"\(\s*\)|\[\s*\]", "", title)
+    return " ".join(title.split()), " ".join(artist.split())
+
+
+def _pick_subtitle_url(*subtitle_maps):
+    """
+    yt-dlp subtitle maps are {language: [format, ...]} for subtitles and
+    automatic captions, but requested_subtitles may be {language: format}.
+    Prefer English and parser-friendly formats, then fall back to anything
+    with a URL.
+    """
+    candidates = []
+    for source_priority, subtitle_map in enumerate(subtitle_maps):
+        for lang, formats in subtitle_map.items():
+            if isinstance(formats, dict):
+                formats = [formats]
+            if not isinstance(formats, list):
+                continue
+
+            lang_priority = _subtitle_lang_priority(lang)
+            for fmt in formats:
+                if not isinstance(fmt, dict) or not fmt.get("url"):
+                    continue
+                ext = (fmt.get("ext") or "").lower()
+                candidates.append((
+                    lang_priority,
+                    source_priority,
+                    _subtitle_ext_priority(ext),
+                    fmt["url"],
+                ))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[:3])
+    return candidates[0][3]
+
+
+def _subtitle_lang_priority(lang):
+    lang = (lang or "").lower()
+    if lang == "en":
+        return 0
+    if lang.startswith("en-") or lang.startswith("en_"):
+        return 1
+    if lang.startswith("en"):
+        return 2
+    return 3
+
+
+def _subtitle_ext_priority(ext):
+    order = {
+        "vtt": 0,
+        "srt": 1,
+        "json3": 2,
+        "srv3": 3,
+        "srv2": 4,
+        "srv1": 5,
+        "ttml": 6,
+    }
+    return order.get(ext, 99)
 
 
 def get_dominant_color(path):
